@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.7
+ * Kinopub plugin for Lampa  v1.4.8
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.7';
+  var PLUGIN_VERSION = '1.4.8';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
   // Время жизни ~24ч, обновлять отсюда https://kino.pub/api → console snippet.
@@ -95,29 +95,21 @@
   }
 
   function buildQualityMap(files) {
-    // Строим обе версии карты: HLS (для адаптивного стриминга) и HTTP (per-quality mp4).
-    // Если у kinopub все hls4-урлы одинаковые (master-плейлист, который сам адаптируется),
-    // переключение в плеере ничего не меняет визуально — тогда qmap отдаём из http
-    // (там URL гарантированно разный на каждое качество).
-    var qHls = {}, qHttp = {};
+    // qmap[quality] → HLS-url. Используем HLS везде: если у kinopub URL'ы
+    // per-quality (variant playlist) — Lampa переключит между ними чисто;
+    // если все одинаковые (master playlist) — hls.js сам адаптирует битрейт.
+    // Микс HLS+HTTP в qmap ломал плавность (переключение на mp4 в hls-сессии
+    // вызывало «лагает и стопается»).
+    var qmap = {};
     var qarr = [];
     (files || []).forEach(function(f) {
       var n = qNum(f.quality);
-      if (!n || !f.url) return;
-      var key  = n + 'p';
-      var hls  = f.url.hls4 || f.url.hls || '';
-      var http = f.url.http || '';
-      if (!qHls[key]  && hls)  qHls[key]  = hls;
-      if (!qHttp[key] && http) qHttp[key] = http;
-      if (qarr.indexOf(n) === -1) qarr.push(n);
+      var u = fileUrl(f);
+      if (n && u && !qmap[n + 'p']) {
+        qmap[n + 'p'] = u;
+        qarr.push(n);
+      }
     });
-
-    var hlsUrls   = Object.keys(qHls).map(function(k) { return qHls[k]; });
-    var uniqueHls = hlsUrls.filter(function(u, i, arr) { return arr.indexOf(u) === i; }).length;
-    var hlsMaster = hlsUrls.length > 1 && uniqueHls === 1;
-
-    var qmap = (hlsMaster && Object.keys(qHttp).length > 0) ? qHttp
-             : (hlsUrls.length > 0 ? qHls : qHttp);
     return { qmap: qmap, qarr: qarr };
   }
 
@@ -1169,18 +1161,20 @@
     var voice = window.__kp_pending_voice;
     if (!voice || (!voice.lang && !voice.author && voice.index == null)) return;
 
-    // 1) hls.js (Lampa обычно держит инстанс в window.hls)
-    try {
-      if (window.hls && window.hls.audioTracks && window.hls.audioTracks.length) {
-        var idx = findAudioTrackIdx(window.hls.audioTracks, voice);
-        if (idx >= 0 && idx !== window.hls.audioTrack) {
-          window.hls.audioTrack = idx;
-          return;
+    // hls-инстанс может лежать в трёх разных местах в зависимости от того,
+    // успел ли отработать наш monkey-patch и как Lampa подхватила Hls.
+    var hls = window.__kp_hls || window.hls || null;
+    if (hls && hls.audioTracks && hls.audioTracks.length) {
+      try {
+        var idx = findAudioTrackIdx(hls.audioTracks, voice);
+        if (idx >= 0 && idx !== hls.audioTrack) {
+          hls.audioTrack = idx;
         }
-      }
-    } catch (e) {}
-
-    // 2) Нативный <video>.audioTracks (для встроенных плееров / MKV)
+        return;
+      } catch (e) {}
+    }
+    // Native <video>.audioTracks — для случаев когда плеер играет НЕ через
+    // hls.js (mp4 fallback или MKV напрямую).
     try {
       var v = document.querySelector('video');
       if (v && v.audioTracks && v.audioTracks.length) {
@@ -1194,25 +1188,92 @@
     } catch (e) {}
   }
 
-  // Слушаем события плеера. Старт каждого нового стрима (новая серия из
-  // плейлиста, ручная пауза-плей, и т.п.) — повод снова применить дорожку.
+  /**
+   * Lampa не выставляет hls-инстанс наружу (window.hls = undefined).
+   * Поэтому monkey-patch'им конструктор Hls: каждый раз когда Lampa делает
+   * new Hls(config), наша обёртка пишет инстанс в window.__kp_hls и
+   * подписывается на AUDIO_TRACKS_UPDATED — чтобы применить выбранную
+   * пользователем озвучку, как только hls.js распарсит мастер-плейлист.
+   */
+  function ensurePatchHls() {
+    // window.Hls появляется только после того как Lampa подгрузит ./vender/hls/hls.js,
+    // а это происходит уже ПОСЛЕ нашего startPlugin. Поэтому ждём в фоне.
+    if (window.Hls && window.Hls.__kp_patched) return;
+    if (window.Hls) { patchHls(); return; }
+    var tries = 0;
+    var iv = setInterval(function() {
+      if (window.Hls && !window.Hls.__kp_patched) {
+        clearInterval(iv);
+        patchHls();
+      } else if (++tries > 120) { // 60 секунд — c запасом
+        clearInterval(iv);
+      }
+    }, 500);
+  }
+
+  function patchHls() {
+    if (!window.Hls || window.Hls.__kp_patched) return;
+    var Original = window.Hls;
+
+    function Patched(config) {
+      var inst = new Original(config);
+      window.__kp_hls = inst;
+      try {
+        var EV = (Original.Events) || (Patched.Events);
+        if (EV && EV.AUDIO_TRACKS_UPDATED) {
+          inst.on(EV.AUDIO_TRACKS_UPDATED, function() { applyKinopubVoice(); });
+        }
+        if (EV && EV.MANIFEST_PARSED) {
+          inst.on(EV.MANIFEST_PARSED, function() { setTimeout(applyKinopubVoice, 200); });
+        }
+      } catch (e) {}
+      return inst;
+    }
+    // Копируем статику (Events, ErrorTypes, isSupported, ...)
+    for (var k in Original) {
+      if (Object.prototype.hasOwnProperty.call(Original, k)) {
+        try { Patched[k] = Original[k]; } catch (e) {}
+      }
+    }
+    Patched.prototype = Original.prototype;
+    Patched.__kp_patched = true;
+    Patched.__original = Original;
+    window.Hls = Patched;
+  }
+
+  // Слушаем события плеера: на старт каждого нового стрима (новая серия,
+  // переоткрытие, и т.п.) повторно применяем озвучку. Это страховка на случай
+  // если monkey-patch был установлен ПОСЛЕ создания Hls-инстанса.
   function bindPlayerListener() {
     if (window.__kp_player_listener) return;
     window.__kp_player_listener = true;
-    Lampa.Listener.follow('player', function(e) {
-      if (!e || !e.type) return;
-      if (e.type === 'start' || e.type === 'video' || e.type === 'change' || e.type === 'inited') {
-        // hls.audioTracks бывает доступен не сразу — пробуем несколько раз
-        setTimeout(applyKinopubVoice,  600);
-        setTimeout(applyKinopubVoice, 1500);
-        setTimeout(applyKinopubVoice, 3000);
+
+    var apply = function() {
+      setTimeout(applyKinopubVoice,  600);
+      setTimeout(applyKinopubVoice, 1500);
+      setTimeout(applyKinopubVoice, 3000);
+    };
+
+    // Канал 1: глобальный Lampa.Listener
+    try {
+      Lampa.Listener.follow('player', function(e) {
+        if (e && (e.type === 'start' || e.type === 'video' || e.type === 'change' || e.type === 'inited')) apply();
+      });
+    } catch (e) {}
+
+    // Канал 2: Lampa.Player.listener (отдельный Listener плеера)
+    try {
+      if (Lampa.Player && Lampa.Player.listener && Lampa.Player.listener.follow) {
+        Lampa.Player.listener.follow('start', apply);
+        Lampa.Player.listener.follow('video', apply);
       }
-    });
+    } catch (e) {}
   }
 
   function startPlugin() {
     window.online_kinopub = true;
-    bindPlayerListener();
+    ensurePatchHls();     // дождаться window.Hls и подменить конструктор
+    bindPlayerListener(); // страховка на повторное применение озвучки
 
     var manifest = {
       type:        'video',
