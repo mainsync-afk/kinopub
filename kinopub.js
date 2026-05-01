@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.3
+ * Kinopub plugin for Lampa  v1.4.4
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.3';
+  var PLUGIN_VERSION = '1.4.4';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
   var kp_token = 'owe26z7w0ezk6idutpi4mta0th3ouwcd';
@@ -37,6 +37,44 @@
     return parts.join(' • ') || ('Audio ' + (idx + 1));
   }
 
+  // Ключ для дедупликации озвучек: (lang, type.id, author.title) — так же
+  // консолидирует kinopub в своём UI.
+  function audioKey(a) {
+    if (!a) return '';
+    var t = (a.type && (a.type.id != null ? a.type.id : a.type.title)) || '';
+    var au = (a.author && a.author.title) || '';
+    return [a.lang || '', t, au].join('|');
+  }
+
+  /**
+   * Собрать уникальные озвучки из episode.audios. Берём ОДИН эпизод-семпл
+   * (обычно у всех серий сезона одинаковый набор), консолидируем по audioKey.
+   */
+  function collectVoices(sampleEp) {
+    if (!sampleEp || !sampleEp.audios || !sampleEp.audios.length) return [];
+    var seen = {};
+    var out = [];
+    sampleEp.audios.forEach(function(a, idx) {
+      var key = audioKey(a);
+      if (seen[key]) return;
+      seen[key] = true;
+      out.push({
+        name:  audioName(a, idx),
+        index: (a.index != null ? a.index : idx),
+        lang:  a.lang || ''
+      });
+    });
+    return out;
+  }
+
+  // Кинопаб поддерживает ?audio=N в URL стрима для выбора дорожки.
+  // Для дорожки 0 (default) ничего не добавляем — стрим и так с ней.
+  function appendAudio(url, idx) {
+    if (!url || !idx) return url;
+    var sep = url.indexOf('?') >= 0 ? '&' : '?';
+    return url + sep + 'audio=' + idx;
+  }
+
   function qNum(q) {
     if (q == null) return 0;
     var s = String(q).toLowerCase();
@@ -62,31 +100,18 @@
   }
 
   function buildQualityMap(files) {
-    // Строим две версии карты: HLS (для адаптивного стриминга) и HTTP (прямые mp4).
-    // У kinopub бывает что url.hls4 == один master-плейлист для всех качеств —
-    // тогда переключение в плеере ничего не делает. Для qmap в этом случае
-    // отдаём http (он гарантированно per-quality), для стрима оставляем hls.
-    var qHls = {}, qHttp = {};
+    // qmap[quality] = HLS-урл нужного качества — плеер использует это
+    // для адаптивного стриминга и для переключения качества.
+    var qmap = {};
     var qarr = [];
     (files || []).forEach(function(f) {
       var n = qNum(f.quality);
-      if (!n || !f.url) return;
-      var key  = n + 'p';
-      var hls  = f.url.hls4 || f.url.hls || '';
-      var http = f.url.http || '';
-      if (!qHls[key]  && hls)  qHls[key]  = hls;
-      if (!qHttp[key] && http) qHttp[key] = http;
-      if (qarr.indexOf(n) === -1) qarr.push(n);
+      var u = fileUrl(f);
+      if (n && u && !qmap[n + 'p']) {
+        qmap[n + 'p'] = u;
+        qarr.push(n);
+      }
     });
-
-    // Все ли HLS-урлы одинаковые? (master-плейлист вместо variant)
-    var hlsKeys = Object.keys(qHls);
-    var uniqueHls = {};
-    hlsKeys.forEach(function(k) { uniqueHls[qHls[k]] = true; });
-    var hlsAllSame = hlsKeys.length > 1 && Object.keys(uniqueHls).length === 1;
-
-    var qmap = (hlsAllSame && Object.keys(qHttp).length > 0) ? qHttp
-             : (hlsKeys.length > 0 ? qHls : qHttp);
     return { qmap: qmap, qarr: qarr };
   }
 
@@ -311,21 +336,33 @@
 
     /* ---------- разбор kinopub item в структуру extract[transl_id] ---------- */
 
-    function makeEpisodeEntry(seasonNum, ep, transl_id) {
+    function makeEpisodeEntry(seasonNum, ep, transl_id, voice) {
       var picked = pickBestFile(ep.files);
       if (!picked) return null;
       var qq = buildQualityMap(ep.files);
+      var aIdx = voice && voice.index ? voice.index : 0;
+
+      // Если выбрана не дефолтная дорожка — навешиваем ?audio=N на основной URL
+      // и на все варианты в qmap, чтобы и переключение качества тоже шло
+      // в нужной озвучке.
+      var url = appendAudio(picked.url, aIdx);
+      var qmap = {};
+      Object.keys(qq.qmap).forEach(function(k) { qmap[k] = appendAudio(qq.qmap[k], aIdx); });
+
       return {
         id:             seasonNum + '_' + ep.number,
         comment:        ep.number + ' ' + Lampa.Lang.translate('torrent_serial_episode'),
         title:          ep.title || '',
-        file:           picked.url,
+        file:           url,
         episode:        ep.number,
         season:         seasonNum,
         quality:        picked.quality,
         qualities:      qq.qarr,
-        qualities_map:  qq.qmap,
-        translation:    transl_id
+        qualities_map:  qmap,
+        translation:    transl_id,
+        voice_index:    aIdx,
+        voice_lang:     voice ? voice.lang : '',
+        voice_name:     voice ? voice.name : ''
       };
     }
 
@@ -345,62 +382,84 @@
       if (!item) return;
 
       if (item.seasons && item.seasons.length) {
-        // Сериал. kinopub отдаёт MKV со всеми аудио-дорожками внутри одного файла —
-        // переключение озвучки в нашем фильтре не меняет URL, поэтому фильтр для
-        // сериалов мы вообще не показываем. Дорожки выбираются в самом плеере.
         var sortedSeasons = sortSeasonsForDisplay(item.seasons);
         var tmdbCounts    = (results && results.__tmdb_counts) || {};
 
-        var transl_id   = 1;
-        var seasonsList = [];
-        var specials    = [];
-        var seasonIdx   = 0;
+        // Берём набор озвучек из первого реального эпизода (у kinopub он
+        // обычно одинаковый по всему сериалу). Консолидируем по audioKey,
+        // чтобы наш список совпадал с тем что показывает kinopub в вебе.
+        var firstReal = null;
+        for (var i = 0; i < sortedSeasons.length; i++) {
+          var n = parseInt(sortedSeasons[i].number) || 0;
+          if (n > 0 && sortedSeasons[i].episodes && sortedSeasons[i].episodes.length) {
+            firstReal = sortedSeasons[i].episodes[0];
+            break;
+          }
+        }
+        var voices = collectVoices(firstReal);
+        if (!voices.length) voices.push({ name: '', index: 0, lang: '' });
 
-        sortedSeasons.forEach(function(season) {
-          var num = parseInt(season.number) || 0;
+        // Для каждой озвучки строим свою «папку» сезонов с URL'ами,
+        // содержащими ?audio=N. Это позволяет выбору в сайдбаре реально
+        // переключать дорожку (kinopub поддерживает параметр audio).
+        voices.forEach(function(voice, vi) {
+          var transl_id   = vi + 1;
+          var seasonsList = [];
+          var specials    = [];
+          var seasonIdx   = 0;
 
-          if (num === 0) {
-            // явный сезон 0 целиком в спецвыпуски
+          sortedSeasons.forEach(function(season) {
+            var num = parseInt(season.number) || 0;
+
+            if (num === 0) {
+              (season.episodes || []).forEach(function(ep) {
+                var entry = makeEpisodeEntry(num, ep, transl_id, voice);
+                if (entry) specials.push(entry);
+              });
+              return;
+            }
+
+            var tmdbMax = tmdbCounts[num];
+            var picks   = [];
             (season.episodes || []).forEach(function(ep) {
-              var entry = makeEpisodeEntry(num, ep, transl_id);
-              if (entry) specials.push(entry);
+              var entry = makeEpisodeEntry(num, ep, transl_id, voice);
+              if (!entry) return;
+              if (tmdbMax != null && ep.number > tmdbMax) {
+                specials.push(entry);
+              } else {
+                picks.push(entry);
+              }
             });
-            return;
+
+            seasonIdx++;
+            seasonsList.push({
+              id:          seasonIdx,
+              comment:     num + ' ' + Lampa.Lang.translate('torrent_serial_season'),
+              folder:      picks,
+              translation: transl_id
+            });
+          });
+
+          if (specials.length) {
+            seasonIdx++;
+            seasonsList.push({
+              id:          seasonIdx,
+              comment:     Lampa.Lang.translate('online_specials'),
+              folder:      specials,
+              translation: transl_id,
+              specials:    true
+            });
           }
 
-          var tmdbMax = tmdbCounts[num];
-          var picks   = [];
-          (season.episodes || []).forEach(function(ep) {
-            var entry = makeEpisodeEntry(num, ep, transl_id);
-            if (!entry) return;
-            if (tmdbMax != null && ep.number > tmdbMax) {
-              specials.push(entry);
-            } else {
-              picks.push(entry);
-            }
-          });
-
-          seasonIdx++;
-          seasonsList.push({
-            id:          seasonIdx,                // 1-based по позиции в filter_items.season
-            comment:     num + ' ' + Lampa.Lang.translate('torrent_serial_season'),
-            folder:      picks,
-            translation: transl_id
-          });
+          extract[transl_id] = {
+            json:       seasonsList,
+            file:       '',
+            voice_name: voice.name,
+            voice_meta: voice
+          };
         });
 
-        if (specials.length) {
-          seasonIdx++;
-          seasonsList.push({
-            id:          seasonIdx,
-            comment:     Lampa.Lang.translate('online_specials'),
-            folder:      specials,
-            translation: transl_id,
-            specials:    true
-          });
-        }
-
-        extract[transl_id] = { json: seasonsList, file: '', voice_name: '' };
+        results.__voices = voices;
       }
       else if (item.videos && item.videos.length) {
         // Фильм / multi-часть
@@ -489,8 +548,18 @@
           }
         });
         if (hasSpecials) filter_items.season.push(Lampa.Lang.translate('online_specials'));
-        // Озвучку для сериалов не показываем — внутри MKV уже все аудио-дорожки,
-        // и переключение этого фильтра не меняет URL. Дорожки выбираются в плеере.
+
+        // Озвучка из __voices (того, что положили в extractData). Каждая
+        // озвучка = свой extract[transl_id] с другими URL (?audio=N).
+        if (results.__voices && results.__voices.length) {
+          results.__voices.forEach(function(v, idx) {
+            var label = v.name || ('Audio ' + (idx + 1));
+            if (filter_items.voice.indexOf(label) === -1) {
+              filter_items.voice.push(label);
+              filter_items.voice_info.push({ id: idx + 1 });
+            }
+          });
+        }
       } else if (results.videos && results.videos.length) {
         for (var transl_id in extract) {
           var name = extract[transl_id].translation || '';
@@ -531,8 +600,10 @@
                   quality:     media.quality + 'p ',
                   qualitys:    media.qualities_map,
                   translation: media.translation,
-                  voice_name:  filter_items.voice[choice.voice] || '',
-                  info:        filter_items.voice[choice.voice] || ''
+                  voice_name:  filter_items.voice[choice.voice] || media.voice_name || '',
+                  voice_lang:  media.voice_lang || '',
+                  voice_index: media.voice_index || 0,
+                  info:        filter_items.voice[choice.voice] || media.voice_name || ''
                 });
               });
               break;
@@ -559,13 +630,19 @@
 
     function toPlayElement(element) {
       var extra = getFile(element, element.quality);
-      return {
+      var play = {
         title:    element.title,
         url:      extra.file,
         quality:  extra.quality,
         timeline: element.timeline,
         callback: element.mark
       };
+      // Подсказка плееру какую дорожку выбрать первой. URL уже содержит
+      // ?audio=N, но Lampa.Player может ещё уточнить выбор внутри плеера
+      // (через hls.js audioTrack или native track selection).
+      if (element.voice_lang)        play.audio       = element.voice_lang;
+      if (element.voice_index != null) play.audio_idx = element.voice_index;
+      return play;
     }
 
     function append(items) {
