@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.12
+ * Kinopub plugin for Lampa  v1.4.13
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.12';
+  var PLUGIN_VERSION = '1.4.13';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
   // Время жизни ~24ч, обновлять отсюда https://kino.pub/api → console snippet.
@@ -596,23 +596,38 @@
           for (var si in element.json) {
             var ep = element.json[si];
             if (ep.id == choice.season + 1) {
+              // Pre-pass: бывает что сохранённый voice.author взят из hls.js
+              // и не сходится ни с author, ни с type ни одной серии. Тогда
+              // строгая проверка пометила бы ВСЕ серии красным — что хуже
+              // чем не помечать вовсе. Поэтому если ни одна серия в сезоне
+              // не пройдёт строгий тест — фоллбэчимся на проверку только
+              // по lang.
+              var anyStrict = false;
+              if (voiceLang || voiceAuthor) {
+                anyStrict = ep.folder.some(function(m) {
+                  return (m.audios || []).some(function(a) {
+                    return audioMatches(a, voiceLang, voiceAuthor);
+                  });
+                });
+              }
+              var matchLangOnly = !anyStrict && voiceLang;
+
               ep.folder.forEach(function(media) {
-                // Есть ли у этой серии выбранная пользователем дорожка?
                 var hasVoice = !voiceLang && !voiceAuthor;
                 if (!hasVoice) {
                   hasVoice = (media.audios || []).some(function(a) {
-                    return audioMatches(a, voiceLang, voiceAuthor);
+                    return matchLangOnly
+                      ? audioMatches(a, voiceLang, '')
+                      : audioMatches(a, voiceLang, voiceAuthor);
                   });
                 }
-                // Если воткнуть label некуда (нет выбора) — пишем пустоту.
-                // Если выбор есть и совпадает — обычная подпись.
-                // Если выбор есть, но в этой серии такой дорожки нет —
-                // пишем тем же текстом, но приглушённо-красным (плеер
-                // всё равно сыграет, просто на дефолтной дорожке).
+                // Если выбора нет — подпись пустая.
+                // Если выбор есть и совпадает — приглушённый зелёный.
+                // Если выбор есть, но дорожки в серии нет — приглушённый розово-красный.
                 var voiceHtml = '';
                 if (voiceLabel) {
                   voiceHtml = hasVoice
-                    ? voiceLabel
+                    ? '<span style="opacity:.85;color:#7adb7e">' + voiceLabel + '</span>'
                     : '<span style="opacity:.55;color:#ff6e58">' + voiceLabel + '</span>';
                 }
                 out.push({
@@ -759,22 +774,6 @@
       files.appendHead(filter.render());
       scroll.body().addClass('torrent-list');
       scroll.minus(files.render().find('.explorer__files-head'));
-
-      // При закрытии плеера перерисовываем список серий, чтобы подпись
-      // выбранной озвучки обновилась моментально (а не только после
-      // переоткрытия карточки).
-      _this.__kp_player_close = function(e) {
-        if (!e) return;
-        if (e.type !== 'destroy' && e.type !== 'close') return;
-        if (Lampa.Activity.active().activity !== _this.activity) return;
-        if (source && source.refresh) source.refresh();
-      };
-      try {
-        if (Lampa.Player && Lampa.Player.listener && Lampa.Player.listener.follow) {
-          Lampa.Player.listener.follow('destroy', _this.__kp_player_close);
-          Lampa.Player.listener.follow('close',   _this.__kp_player_close);
-        }
-      } catch (e) {}
 
       this.search();
     };
@@ -1153,6 +1152,11 @@
     this.start = function() {
       if (Lampa.Activity.active().activity !== this.activity) return;
       if (!initialized) { initialized = true; this.initialize(); }
+      else {
+        // re-activation (вернулись из плеера / другой активити) —
+        // перерисовываем список с актуальным выбором озвучки из cache.
+        if (source && source.refresh) source.refresh();
+      }
       Lampa.Background.immediately(Lampa.Utils.cardImgBackgroundBlur(object.movie));
       Lampa.Controller.add('content', {
         toggle: function() {
@@ -1178,14 +1182,6 @@
       files.destroy();
       scroll.destroy();
       if (source && source.destroy) source.destroy();
-      // Снимаем хуки на закрытие плеера, чтобы они не дёргали
-      // уже уничтоженный source при следующем закрытии плеера.
-      try {
-        if (this.__kp_player_close && Lampa.Player && Lampa.Player.listener && Lampa.Player.listener.remove) {
-          Lampa.Player.listener.remove('destroy', this.__kp_player_close);
-          Lampa.Player.listener.remove('close',   this.__kp_player_close);
-        }
-      } catch (e) {}
     };
   }
 
@@ -1237,10 +1233,25 @@
   }
 
   // Совпадает ли запись из episode.audios с сохранённым выбором.
+  // Сохранённый voice.author приходит из hls.js track.name — это произвольная
+  // строка из HLS-плейлиста (может быть и "Дубляж", и "LostFilm", и
+  // "Russian (Дубляж)"). API kinopub раскладывает озвучку на отдельные
+  // поля {author, type} — поэтому проверяем сразу всё, во всех комбинациях.
   function audioMatches(audio, voiceLang, voiceAuthor) {
     if (!voiceLang && !voiceAuthor) return true;
     if (voiceLang && !langEq(audio.lang || '', voiceLang)) return false;
-    if (voiceAuthor && !authorEq(audio.author || '', voiceAuthor)) return false;
+    if (voiceAuthor) {
+      var a = audio.author || '';
+      var t = audio.type   || '';
+      var combos = [a, t];
+      if (a && t) {
+        combos.push(a + ' ' + t);
+        combos.push(a + ' • ' + t);
+        combos.push(t + ' ' + a);
+      }
+      var matched = combos.some(function(s) { return s && authorEq(s, voiceAuthor); });
+      if (!matched) return false;
+    }
     return true;
   }
 
