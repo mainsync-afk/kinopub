@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.13
+ * Kinopub plugin for Lampa  v1.4.14
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.13';
+  var PLUGIN_VERSION = '1.4.14';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
   // Время жизни ~24ч, обновлять отсюда https://kino.pub/api → console snippet.
@@ -297,14 +297,23 @@
     /**
      * Перерисовать список серий с актуальной озвучкой из cache (saveKinopubVoice
      * мог обновить storage в момент когда плеер был открыт). choice резетить НЕ
-     * нужно — только подсосать свежие voice_lang/author из getChoice.
+     * нужно — только подтянуть свежие voice_*-поля.
+     *
+     * НЕ используем Lampa.Arrays.extend(choice, savedRef, true) — savedRef
+     * фактически === choice (saveChoice писал по ссылке), и deep-extend
+     * создаёт самореференцию → JSON.stringify падает с RangeError.
      */
     this.refresh = function() {
       if (!results) return;
       try {
-        if (component.getChoice) {
-          var saved = component.getChoice();
-          Lampa.Arrays.extend(choice, saved, true);
+        var key  = 'online_choice_' + balanser;
+        var data = Lampa.Storage.cache(key, 3000, {});
+        var id   = (object.movie && object.movie.id);
+        var saved = (id != null && data[id]) ? data[id] : null;
+        if (saved && saved !== choice) {
+          ['voice_lang','voice_author','voice_type','voice_name'].forEach(function(k) {
+            if (k in saved) choice[k] = saved[k];
+          });
         }
       } catch (e) {}
       component.reset();
@@ -590,35 +599,34 @@
         // плеер играет свою дефолтную дорожку.
         var voiceLang   = choice.voice_lang   || '';
         var voiceAuthor = choice.voice_author || '';
+        var voiceType   = choice.voice_type   || '';
         var voiceLabel  = choice.voice_name   || '';
         var element = extract[1];
         if (element && element.json) {
           for (var si in element.json) {
             var ep = element.json[si];
             if (ep.id == choice.season + 1) {
-              // Pre-pass: бывает что сохранённый voice.author взят из hls.js
-              // и не сходится ни с author, ни с type ни одной серии. Тогда
-              // строгая проверка пометила бы ВСЕ серии красным — что хуже
-              // чем не помечать вовсе. Поэтому если ни одна серия в сезоне
-              // не пройдёт строгий тест — фоллбэчимся на проверку только
-              // по lang.
+              // Pre-pass: если строгое сравнение (lang+author/type) ни с одной
+              // серией не сходится (бывает когда сохранили track.name из hls,
+              // а в API kinopub автор/тип называются иначе) — фоллбэчимся на
+              // проверку только по lang. Это лучше чем красить весь сезон.
               var anyStrict = false;
-              if (voiceLang || voiceAuthor) {
+              if (voiceLang || voiceAuthor || voiceType) {
                 anyStrict = ep.folder.some(function(m) {
                   return (m.audios || []).some(function(a) {
-                    return audioMatches(a, voiceLang, voiceAuthor);
+                    return audioMatches(a, voiceLang, voiceAuthor, voiceType);
                   });
                 });
               }
               var matchLangOnly = !anyStrict && voiceLang;
 
               ep.folder.forEach(function(media) {
-                var hasVoice = !voiceLang && !voiceAuthor;
+                var hasVoice = !voiceLang && !voiceAuthor && !voiceType;
                 if (!hasVoice) {
                   hasVoice = (media.audios || []).some(function(a) {
                     return matchLangOnly
-                      ? audioMatches(a, voiceLang, '')
-                      : audioMatches(a, voiceLang, voiceAuthor);
+                      ? audioMatches(a, voiceLang, '', '')
+                      : audioMatches(a, voiceLang, voiceAuthor, voiceType);
                   });
                 }
                 // Если выбора нет — подпись пустая.
@@ -642,6 +650,7 @@
                   voice_author:  voiceAuthor,
                   voice_index:   0,
                   voice_missing: !hasVoice && !!voiceLabel,
+                  audios:        media.audios || [],
                   info:          voiceHtml
                 });
               });
@@ -700,9 +709,13 @@
         onEnter: function(item, html) {
           var extra = getFile(item, item.quality);
           if (extra.file) {
-            // Запоминаем item_id для AUDIO_TRACK_SWITCHED-листенера —
-            // он использует это чтобы сохранить выбор именно для этого тайтла.
-            try { window.__kp_current_item_id = object.movie.id; } catch (er) {}
+            // Запоминаем item_id и audios текущей серии — listener
+            // AUDIO_TRACK_SWITCHED по ним поймёт какую озвучку юзер выбрал
+            // на стороне kinopub-API (а не голый track.name из hls).
+            try {
+              window.__kp_current_item_id = object.movie.id;
+              window.__kp_current_audios  = item.audios || [];
+            } catch (er) {}
             var playlist = [];
             var first    = toPlayElement(item);
             if (item.season) items.forEach(function(elem) { playlist.push(toPlayElement(elem)); });
@@ -1232,14 +1245,26 @@
     return -1;
   }
 
-  // Совпадает ли запись из episode.audios с сохранённым выбором.
-  // Сохранённый voice.author приходит из hls.js track.name — это произвольная
-  // строка из HLS-плейлиста (может быть и "Дубляж", и "LostFilm", и
-  // "Russian (Дубляж)"). API kinopub раскладывает озвучку на отдельные
-  // поля {author, type} — поэтому проверяем сразу всё, во всех комбинациях.
-  function audioMatches(audio, voiceLang, voiceAuthor) {
-    if (!voiceLang && !voiceAuthor) return true;
+  // Совпадает ли запись episode.audios с сохранённым выбором.
+  // Если есть точный kp-side {author, type} (saveKinopubVoice сохранил
+  // их из window.__kp_current_audios) — сравниваем поля «как есть».
+  // Если есть только author из hls track.name — fuzzy substring match
+  // против комбинаций author/type/their concat.
+  function audioMatches(audio, voiceLang, voiceAuthor, voiceType) {
+    if (!voiceLang && !voiceAuthor && !voiceType) return true;
     if (voiceLang && !langEq(audio.lang || '', voiceLang)) return false;
+    // Если у нас в воиc есть точный kinopub type и author — строгий матч
+    if (voiceType) {
+      var aA = audio.author || '';
+      var aT = audio.type   || '';
+      var typeOk   = !voiceType   || authorEq(aT, voiceType);
+      var authorOk = !voiceAuthor || authorEq(aA, voiceAuthor);
+      // Оба строго: type и author (если оба заданы)
+      if (!typeOk) return false;
+      if (voiceAuthor && !authorOk) return false;
+      return true;
+    }
+    // Иначе fuzzy против комбинаций
     if (voiceAuthor) {
       var a = audio.author || '';
       var t = audio.type   || '';
@@ -1257,29 +1282,35 @@
 
   /**
    * Сохранить выбранную пользователем озвучку в Lampa.Storage кэш.
-   * Вызывается из AUDIO_TRACK_SWITCHED (когда юзер меняет дорожку прямо
-   * в OSD плеера). Запоминаем по item_id — на след. серию / следующее
-   * открытие карточки applyKinopubVoice найдёт ту же дорожку.
+   * Вызывается из AUDIO_TRACK_SWITCHED. Если у нас в памяти есть аудиолист
+   * текущей серии (window.__kp_current_audios — выставляется в onEnter), мы
+   * берём НАСТОЯЩИЕ kinopub-поля {lang, author, type} — это даёт точный
+   * матчинг при пометке остальных серий. track.name из hls.js часто пустой
+   * или нестандартный, ему доверяем во вторую очередь.
    */
-  function saveKinopubVoice(track) {
-    if (!track) return;
-    // hls.js audio track: { id, name, lang, default, groupId, type, ... }
+  function saveKinopubVoice(track, kpAudio) {
+    if (!track && !kpAudio) return;
+    var t = track || {};
+    var k = kpAudio || {};
     var voice = {
-      lang:   track.lang || track.language || '',
-      author: track.name || track.label    || '',
-      index:  (track.id != null ? track.id : 0),
-      name:   track.name || track.label    || ''
+      lang:   k.lang   || t.lang  || t.language || '',
+      author: k.author || t.name  || t.label    || '',
+      type:   k.type   || '',
+      // Display label: предпочитаем то что показывает плеер (track.name).
+      // Если он пустой — собираем из kp-полей.
+      name:   (t.name || t.label) || (k.author ? k.author + (k.type ? ' • ' + k.type : '') : (k.type || ''))
     };
     window.__kp_pending_voice = voice;
 
     var item_id = window.__kp_current_item_id;
     if (!item_id) return;
     try {
-      var key = 'online_choice_kpapi';
+      var key  = 'online_choice_kpapi';
       var data = Lampa.Storage.cache(key, 3000, {});
       if (!data[item_id]) data[item_id] = {};
       data[item_id].voice_lang   = voice.lang;
       data[item_id].voice_author = voice.author;
+      data[item_id].voice_type   = voice.type;
       data[item_id].voice_name   = voice.name;
       Lampa.Storage.set(key, data);
     } catch (e) {}
@@ -1370,7 +1401,11 @@
               try {
                 var id = inst.audioTrack;
                 var track = inst.audioTracks && inst.audioTracks[id];
-                if (track) saveKinopubVoice(track);
+                // hls audio idx обычно совпадает с kinopub episode.audios[idx]
+                // (HLS-плейлист генерится в том же порядке) — это даёт нам
+                // точный author/type для сохранения и матчинга.
+                var kpAudio = window.__kp_current_audios && window.__kp_current_audios[id];
+                if (track || kpAudio) saveKinopubVoice(track, kpAudio);
               } catch (e) {}
             });
           }
