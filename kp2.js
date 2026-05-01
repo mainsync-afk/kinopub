@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '2.0.7-debug';
+  var PLUGIN_VERSION = '2.0.8-debug';
 
   /* ============================================================
    * REMOTE DEBUG LOGGER (опционально)
@@ -1649,13 +1649,20 @@
    * ЛЮБОЙ инстанс независимо от того, кто и когда его создал.
    */
   function patchHlsPrototype() {
+    console.log('[kp2 v2.0.8] patchHlsPrototype: ENTRY', {
+      already: !!window.__kp_hls_proto_patched,
+      has_Hls: !!window.Hls,
+      has_proto: !!(window.Hls && window.Hls.prototype),
+      has_attachMedia: !!(window.Hls && window.Hls.prototype && window.Hls.prototype.attachMedia),
+      proto_keys: window.Hls && window.Hls.prototype
+        ? Object.getOwnPropertyNames(window.Hls.prototype).slice(0, 40)
+        : null,
+      Hls_static_keys: window.Hls ? Object.getOwnPropertyNames(window.Hls).slice(0, 30) : null,
+      Hls_version: window.Hls && window.Hls.version
+    });
     if (window.__kp_hls_proto_patched) return;
     if (!window.Hls || !window.Hls.prototype || !window.Hls.prototype.attachMedia) {
-      console.log('[kp2] proto-patch: skip', {
-        has_Hls: !!window.Hls,
-        has_proto: !!(window.Hls && window.Hls.prototype),
-        has_attachMedia: !!(window.Hls && window.Hls.prototype && window.Hls.prototype.attachMedia)
-      });
+      console.log('[kp2 v2.0.8] proto-patch: skip');
       return;
     }
     var origAttach = window.Hls.prototype.attachMedia;
@@ -2128,10 +2135,11 @@
   }
 
   try {
-    console.log('[kp2] gate', {
+    console.log('[kp2 v' + PLUGIN_VERSION + '] gate', {
       already: !!window.online_kinopub2,
       app_digital: (Lampa.Manifest && Lampa.Manifest.app_digital),
       hls_present: !!window.Hls,
+      hls_version: (window.Hls && window.Hls.version),
       kp_token_len: (kp_token || '').length
     });
   } catch (e) {}
