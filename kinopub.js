@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.5.0
+ * Kinopub plugin for Lampa  v1.5.1
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -15,7 +15,7 @@
   var api_url   = 'https://api.srvkp.com/v1/';
   var oauth_url = 'https://api.srvkp.com/oauth2/';
   // Креды из официального PWA kinopub. xbmc-секрет старого Kodi-аддона
-  // отозван, эта пара — рабочая на момент v1.5.0.
+  // отозван, эта пара — рабочая на момент v1.5.1.
   var KP_CLIENT_ID     = 'xbmc';
   var KP_CLIENT_SECRET = 'cgg3gtifu46urtfp2zp1nqtba0k2ezxh';
 
@@ -83,7 +83,8 @@
     });
     var net2 = new Lampa.Reguest();
     net2.timeout(15000);
-    net2.silent(oauth_url + 'token', function(json) {
+    // У kinopub все grant_type'ы идут на /oauth2/device — единый эндпойнт.
+    net2.silent(oauth_url + 'device', function(json) {
       if (json && json.access_token) {
         kp_token = json.access_token;
         Lampa.Storage.set('kp_token', kp_token);
@@ -300,9 +301,10 @@
         });
       }, 5000);
 
-      // Запрос device-кода
+      // Запрос device-кода (Kodi-аддон использует именно 'device_code',
+      // 'client_credentials' kinopub отвергает с 'unauthorized_client').
       var initBody = urlEncodeForm({
-        grant_type:    'client_credentials',
+        grant_type:    'device_code',
         client_id:     KP_CLIENT_ID,
         client_secret: KP_CLIENT_SECRET
       });
