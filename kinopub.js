@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.6
+ * Kinopub plugin for Lampa  v1.4.7
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,10 +9,11 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.6';
+  var PLUGIN_VERSION = '1.4.7';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
-  var kp_token = 'owe26z7w0ezk6idutpi4mta0th3ouwcd';
+  // Время жизни ~24ч, обновлять отсюда https://kino.pub/api → console snippet.
+  var kp_token = 'y5yewmq01148rdz8n173sc48o7q2i4os';
 
   var api_url  = 'https://api.service-kp.com/v1/';
 
