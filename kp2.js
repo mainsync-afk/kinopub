@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '2.0.9-debug';
+  var PLUGIN_VERSION = '2.1.1-voiceovers';
 
   /* ============================================================
    * REMOTE DEBUG LOGGER (опционально)
@@ -82,6 +82,44 @@
       'kp2 v' + PLUGIN_VERSION + ' logger online',
       'UA=' + (navigator.userAgent || '').slice(0, 140)
     ]);
+
+    /* ============================================================
+     * BULK LOG DUMP (Lampa.Console.export)
+     * ============================================================
+     * Lampa внутри держит буфер всех console.log в module-scope
+     * (src/interaction/console.js → original{App, Errors, Warnings, ...}).
+     * Этот буфер выставлен наружу как Lampa.Console.export().
+     * Здесь дёргаем его и POST'им на сервер: эквивалент UI-кнопки
+     * «Экспорт логов», но без cub.rip и без кода.
+     *
+     * Точка приёма на python-сервере — POST {logUrl_root}/dump.
+     * (logUrl у нас ".../l", соответственно меняем на ".../dump")
+     * ============================================================ */
+    var dumpUrl = logUrl.replace(/\/l$/, '/dump');
+    function dumpLampaLogs(reason) {
+      try {
+        if (!window.Lampa || !Lampa.Console || typeof Lampa.Console.export !== 'function') return;
+        var dump = Lampa.Console.export();
+        var payload = JSON.stringify({
+          reason: reason || '',
+          ts: Date.now(),
+          ua: (navigator.userAgent || '').slice(0, 200),
+          plugin_version: PLUGIN_VERSION,
+          logs: dump
+        });
+        var xhr = new XMLHttpRequest();
+        xhr.open('POST', dumpUrl, true);
+        xhr.setRequestHeader('Content-Type', 'application/json');
+        xhr.send(payload);
+      } catch (e) { try { send('dump-err', [String(e)]); } catch (er) {} }
+    }
+    // Автозапуск через 10с после буста (Lampa уже загружена и начала логи копить)
+    setTimeout(function() { dumpLampaLogs('boot+10s'); }, 10000);
+    // Каждые 30с — фоновый pull. На Tizen это ~5–50 КБ за раз, не страшно.
+    setInterval(function() { dumpLampaLogs('interval'); }, 30000);
+    // Глобальная функция: можно дёрнуть руками через Lampa Terminal или через
+    // нашу же кнопку в UI: window.kp2_dump('manual')
+    window.kp2_dump = dumpLampaLogs;
   })();
 
   /* ---------- авторизационные креды и эндпойнты ---------- */
@@ -931,20 +969,34 @@
         timeline: element.timeline,
         callback: element.mark
       };
-      // Метаданные выбранной озвучки. Их подхватит глобальный
-      // 'player' listener и переключит дорожку через hls.js / video.audioTracks.
+      // Метаданные выбранной озвучки.
       if (element.voice_lang)            play.kp_voice_lang   = element.voice_lang;
       if (element.voice_author)          play.kp_voice_author = element.voice_author;
       if (element.voice_index != null)   play.kp_voice_index  = element.voice_index;
       if (element.voice_name)            play.kp_voice_name   = element.voice_name;
-      // Сохраняем «глобально» — listener возьмёт это значение даже когда
-      // плеер переключится на след. серию из плейлиста.
       window.__kp_pending_voice = {
         lang:   element.voice_lang   || '',
         author: element.voice_author || '',
         index:  (element.voice_index != null ? element.voice_index : 0),
         name:   element.voice_name   || ''
       };
+      // === voiceovers (v2.1) ===
+      // Lampa.Player.play(data) при наличии data.voiceovers вызывает
+      // Panel.setTracks(data.voiceovers) — кнопка дорожек в OSD появится
+      // автоматически. Каждый элемент имеет onSelect, в котором мы
+      // сохраняем выбор и переключаем активный плеер (AVPlay/hls.js).
+      var voiceovers = buildVoiceovers(element, {
+        voice_lang:   element.voice_lang,
+        voice_author: element.voice_author,
+        voice_type:   element.voice_type || '',
+        voice_name:   element.voice_name
+      });
+      if (voiceovers) {
+        play.voiceovers = voiceovers;
+        // Запоминаем глобально, чтобы при старте плеера сразу применить
+        // pre-selected дорожку (без ожидания клика юзера).
+        window.__kp_pending_voiceovers = voiceovers;
+      }
       return play;
     }
 
@@ -1546,13 +1598,14 @@
     if (!track && !kpAudio) return;
     var t = track || {};
     var k = kpAudio || {};
+    // kinopub.author/type — это объекты {id, title}, не строки. Извлекаем title.
+    var kAuthor = (k.author && typeof k.author === 'object' && k.author.title) || (typeof k.author === 'string' ? k.author : '');
+    var kType   = (k.type   && typeof k.type   === 'object' && k.type.title)   || (typeof k.type   === 'string' ? k.type   : '');
     var voice = {
       lang:   k.lang   || t.lang  || t.language || '',
-      author: k.author || t.name  || t.label    || '',
-      type:   k.type   || '',
-      // Display label: предпочитаем то что показывает плеер (track.name).
-      // Если он пустой — собираем из kp-полей.
-      name:   (t.name || t.label) || (k.author ? k.author + (k.type ? ' • ' + k.type : '') : (k.type || ''))
+      author: kAuthor || t.name || t.label || '',
+      type:   kType,
+      name:   (t.name || t.label) || (kAuthor ? kAuthor + (kType ? ' • ' + kType : '') : (kType || ''))
     };
     window.__kp_pending_voice = voice;
 
@@ -1583,6 +1636,137 @@
       }
       Lampa.Storage.set(key, clean);
     } catch (e) {}
+  }
+
+  /**
+   * Применить выбранную озвучку к АКТИВНОМУ плееру.
+   *
+   * Из исходника Lampa (v3.x):
+   *   - На Tizen с Storage.field('player')=='tizen' воспроизводит AVPlay
+   *     (webapis.avplay), переключение дорожки — setSelectTrack('AUDIO', idx).
+   *   - Иначе используется hls.js + <video>; переключение — hls.audioTrack=id.
+   *
+   * Для AVPlay AUDIO-индекс — это item.index из getTotalTrackInfo()
+   * (отфильтрованного по type=='AUDIO'). Порядок дорожек в манифесте
+   * совпадает с kinopub episode.audios (kinopub строит мастер-плейлист
+   * в том же порядке, в котором отдаёт audios), поэтому kp_idx → AVPlay
+   * audio_position подходит как маппинг.
+   *
+   * Для hls.js — пытаемся сначала матчить по lang+name (track.lang часто
+   * есть, name бывает пустой), при неудаче — по индексу.
+   */
+  function applyVoiceToActivePlayer(kpAudio, kpIdx) {
+    var ts = Date.now();
+    var player_setting = '';
+    try { player_setting = Lampa.Storage.field('player') || ''; } catch (e) {}
+
+    // ---------- Tizen AVPlay ----------
+    if (player_setting === 'tizen' && window.webapis && window.webapis.avplay) {
+      try {
+        var info = window.webapis.avplay.getTotalTrackInfo() || [];
+        var audioTracks = [];
+        for (var i = 0; i < info.length; i++) {
+          if ((info[i].type || '').toUpperCase() === 'AUDIO') audioTracks.push(info[i]);
+        }
+        var pick = audioTracks[kpIdx] || null;
+        console.log('[kp2] applyVoice: avplay path', {
+          kp_idx: kpIdx, audio_n: audioTracks.length,
+          pick_idx: pick && pick.index, pick_lang: pick && pick.extra_info
+        });
+        if (pick) {
+          window.webapis.avplay.setSelectTrack('AUDIO', pick.index);
+          return true;
+        }
+      } catch (e) {
+        console.log('[kp2] applyVoice: avplay err', String(e));
+      }
+    }
+
+    // ---------- hls.js ----------
+    // Kinopub строит мастер-плейлист в том же порядке, что и episode.audios,
+    // поэтому для hls тоже используем прямое сопоставление по индексу.
+    var hls = window.__kp_hls;
+    if (hls && hls.audioTracks && hls.audioTracks.length > kpIdx) {
+      try {
+        var t = hls.audioTracks[kpIdx];
+        var trackId = (typeof t.id === 'number') ? t.id : kpIdx;
+        console.log('[kp2] applyVoice: hls path', {
+          kp_idx: kpIdx, hls_n: hls.audioTracks.length,
+          track_id: trackId, track_lang: t.lang, track_name: t.name
+        });
+        hls.audioTrack = trackId;
+        return true;
+      } catch (e) {
+        console.log('[kp2] applyVoice: hls err', String(e));
+      }
+    }
+
+    console.log('[kp2] applyVoice: no active player', { took_ms: Date.now() - ts });
+    return false;
+  }
+
+  /**
+   * Построить voiceovers-массив для Lampa.Player.play(data).
+   * Lampa автоматически покажет кнопку дорожек в OSD, и при клике
+   * вызовет наш onSelect — там мы сохраняем выбор и переключаем дорожку.
+   * Один из элементов помечается selected: true (последний выбранный
+   * пользователем для этого фильма/сериала, либо первый по дефолту).
+   */
+  function buildVoiceovers(media, choice) {
+    var audios = (media && media.audios) || [];
+    if (!audios.length) return null;
+    var savedLang   = (choice && choice.voice_lang)   || '';
+    var savedAuthor = (choice && choice.voice_author) || '';
+    var savedType   = (choice && choice.voice_type)   || '';
+    var anySelected = false;
+
+    var voiceovers = audios.map(function(audio, idx) {
+      var author = (audio.author && audio.author.title) || audio.author || '';
+      var atype  = (audio.type   && audio.type.title)   || audio.type   || '';
+      var lang   = audio.lang || '';
+      var parts = [];
+      if (author) parts.push(author);
+      if (atype)  parts.push(atype);
+      var label = parts.join(' • ') || lang.toUpperCase() || ('Track ' + (idx + 1));
+
+      var isSelected = (savedLang || savedAuthor || savedType)
+        ? audioMatches(audio, savedLang, savedAuthor, savedType)
+        : (idx === 0);
+      if (isSelected) anySelected = true;
+
+      return {
+        title:    label,
+        name:     label,
+        language: lang,
+        label:    atype,
+        extra: {
+          channels: (audio.codec && (audio.codec + '').toUpperCase()) || '',
+          fourCC:   ''
+        },
+        selected: isSelected,
+        enabled:  isSelected,
+        kp_audio: audio,
+        kp_index: idx,
+        onSelect: function(item) {
+          try {
+            console.log('[kp2] voiceover.onSelect', {
+              kp_index: item.kp_index, label: item.title
+            });
+            saveKinopubVoice(null, audio);
+            applyVoiceToActivePlayer(audio, idx);
+          } catch (e) {
+            console.log('[kp2] voiceover.onSelect err', String(e));
+          }
+        }
+      };
+    });
+
+    // Если ни один не помечен — пометим первый
+    if (!anySelected && voiceovers.length) {
+      voiceovers[0].selected = true;
+      voiceovers[0].enabled  = true;
+    }
+    return voiceovers;
   }
 
   function applyKinopubVoice() {
@@ -1628,6 +1812,7 @@
    * пользователем озвучку, как только hls.js распарсит мастер-плейлист.
    */
   function ensurePatchHls() {
+    patchVideoBridge();
     // window.Hls появляется только после того как Lampa подгрузит ./vender/hls/hls.js,
     // а это происходит уже ПОСЛЕ нашего startPlugin. Поэтому ждём в фоне.
     if (window.Hls) patchHls();
@@ -1661,13 +1846,55 @@
    * и new Hls() обязательно проходит через него. Этим способом мы ловим
    * ЛЮБОЙ инстанс независимо от того, кто и когда его создал.
    */
+  function hookHlsInstance(instance, source) {
+    if (!instance || instance.__kp_hooked) return;
+    instance.__kp_hooked = true;
+    window.__kp_hls = instance;
+    try {
+      console.log('[kp2] hooking Hls instance', {
+        source: source,
+        v: window.Hls && window.Hls.version,
+        tracks_n: instance.audioTracks && instance.audioTracks.length
+      });
+    } catch (e) {}
+    try {
+      var EV = (window.Hls && window.Hls.Events) || (instance.constructor && instance.constructor.Events);
+      if (!EV) { console.log('[kp2] no EV available'); return; }
+      if (EV.AUDIO_TRACKS_UPDATED) {
+        instance.on(EV.AUDIO_TRACKS_UPDATED, function() {
+          try {
+            console.log('[kp2] AUDIO_TRACKS_UPDATED', {
+              n: instance.audioTracks && instance.audioTracks.length
+            });
+          } catch (e) {}
+          applyKinopubVoice();
+        });
+      }
+      if (EV.MANIFEST_PARSED) {
+        instance.on(EV.MANIFEST_PARSED, function() { setTimeout(applyKinopubVoice, 200); });
+      }
+      if (EV.AUDIO_TRACK_SWITCHED) {
+        instance.on(EV.AUDIO_TRACK_SWITCHED, function() {
+          try {
+            var id = instance.audioTrack;
+            var track = instance.audioTracks && instance.audioTracks[id];
+            var kpAudio = window.__kp_current_audios && window.__kp_current_audios[id];
+            console.log('[kp2] AUDIO_TRACK_SWITCHED', {
+              id: id, track_lang: track && track.lang,
+              track_name: track && track.name, kp_audio: kpAudio
+            });
+            if (track || kpAudio) saveKinopubVoice(track, kpAudio);
+          } catch (e) {}
+        });
+      }
+    } catch (e) { console.log('[kp2] hook err', String(e)); }
+  }
+
   function patchHlsPrototype() {
     if (!window.Hls || !window.Hls.prototype || !window.Hls.prototype.attachMedia) {
       console.log('[kp2] proto-patch: no Hls/proto/attachMedia, skip');
       return;
     }
-    // Per-prototype флаг! Lampa/bwa подменяют window.Hls на лету (1.1.2 → 1.4.7),
-    // и каждый новый прототип нужно патчить отдельно. Глобальный флаг здесь не подходит.
     var proto = window.Hls.prototype;
     if (proto.__kp_proto_patched) return;
 
@@ -1676,58 +1903,115 @@
       proto_keys_count: Object.getOwnPropertyNames(proto).length
     });
 
+    // Patch attachMedia
     var origAttach = proto.attachMedia;
     proto.attachMedia = function(media) {
-      var instance = this;
-      window.__kp_hls = instance;
       try {
         console.log('[kp2] Hls.attachMedia intercepted (proto)', {
-          v: window.Hls && window.Hls.version,
-          tracks_n: instance.audioTracks && instance.audioTracks.length
+          v: window.Hls && window.Hls.version
         });
       } catch (e) {}
-      try {
-        var EV = window.Hls && window.Hls.Events;
-        if (EV) {
-          if (EV.AUDIO_TRACKS_UPDATED) {
-            instance.on(EV.AUDIO_TRACKS_UPDATED, function() {
-              try {
-                console.log('[kp2] AUDIO_TRACKS_UPDATED (proto)', {
-                  n: instance.audioTracks && instance.audioTracks.length
-                });
-              } catch (e) {}
-              applyKinopubVoice();
-            });
-          }
-          if (EV.MANIFEST_PARSED) {
-            instance.on(EV.MANIFEST_PARSED, function() { setTimeout(applyKinopubVoice, 200); });
-          }
-          if (EV.AUDIO_TRACK_SWITCHED) {
-            instance.on(EV.AUDIO_TRACK_SWITCHED, function() {
-              try {
-                var id = instance.audioTrack;
-                var track = instance.audioTracks && instance.audioTracks[id];
-                var kpAudio = window.__kp_current_audios && window.__kp_current_audios[id];
-                console.log('[kp2] AUDIO_TRACK_SWITCHED (proto)', {
-                  id: id,
-                  track_lang: track && track.lang,
-                  track_name: track && track.name,
-                  kp_audio: kpAudio
-                });
-                if (track || kpAudio) saveKinopubVoice(track, kpAudio);
-              } catch (e) {}
-            });
-          }
-        }
-      } catch (e) {
-        try { console.log('[kp2] proto-hook err', String(e)); } catch (er) {}
-      }
       return origAttach.apply(this, arguments);
     };
+
+    // Patch loadSource (альтернативный entry-point — иногда зовут раньше attachMedia)
+    if (proto.loadSource) {
+      var origLoadSource = proto.loadSource;
+      proto.loadSource = function(url) {
+        try {
+          console.log('[kp2] Hls.loadSource intercepted (proto)', {
+            v: window.Hls && window.Hls.version,
+            url_tail: (url || '').slice(-60)
+          });
+        } catch (e) {}
+        hookHlsInstance(this, 'loadSource');
+        return origLoadSource.apply(this, arguments);
+      };
+    }
+
     proto.__kp_proto_patched = true;
     console.log('[kp2] Hls.prototype.attachMedia PATCHED', {
       version: window.Hls && window.Hls.version
     });
+  }
+
+  /**
+   * Глобальный мост: патчим HTMLMediaElement.prototype.addEventListener.
+   * Любой плеер, использующий <video>, обязательно подписывается на события.
+   * Когда видим listener на 'loadedmetadata' / 'canplay' — это знак, что
+   * видео-поток готов. Тогда сканируем глобально все объекты с интерфейсом
+   * Hls (audioTracks + on()) и подцепляемся к найденному.
+   */
+  function patchVideoBridge() {
+    if (window.__kp_video_bridge) return;
+    window.__kp_video_bridge = true;
+    try {
+      var protoME = window.HTMLMediaElement && window.HTMLMediaElement.prototype;
+      if (!protoME) { console.log('[kp2] no HTMLMediaElement.prototype'); return; }
+      var origAddEv = protoME.addEventListener;
+      protoME.addEventListener = function(type, listener, opts) {
+        try {
+          if (type === 'loadedmetadata' || type === 'canplay') {
+            console.log('[kp2] video.addEventListener', { type: type });
+            // Через 100/500/1500 мс пробуем найти hls и подцепиться
+            setTimeout(deepProbeHls, 100);
+            setTimeout(deepProbeHls, 500);
+            setTimeout(deepProbeHls, 1500);
+          }
+        } catch (e) {}
+        return origAddEv.apply(this, arguments);
+      };
+      console.log('[kp2] video bridge patched');
+    } catch (e) {
+      console.log('[kp2] video bridge err', String(e));
+    }
+  }
+
+  function deepProbeHls() {
+    if (window.__kp_hls && window.__kp_hls.__kp_hooked) return;
+    var found = null;
+    var foundVia = '';
+    function looksLikeHls(o) {
+      return o && typeof o === 'object'
+        && Array.isArray(o.audioTracks)
+        && typeof o.on === 'function'
+        && Array.isArray(o.levels);
+    }
+    // Walk a few well-known namespaces deeply (1 level)
+    var roots = [
+      ['Lampa.Player', Lampa.Player],
+      ['Lampa.PlayerVideo', Lampa.PlayerVideo],
+      ['Lampa.Player.video', Lampa.Player && Lampa.Player.video],
+      ['Lampa.PlayerVideo.video', Lampa.PlayerVideo && Lampa.PlayerVideo.video]
+    ];
+    for (var r = 0; r < roots.length; r++) {
+      var rname = roots[r][0]; var robj = roots[r][1];
+      if (!robj) continue;
+      try {
+        for (var k in robj) {
+          try {
+            var v = robj[k];
+            if (looksLikeHls(v)) {
+              found = v; foundVia = rname + '.' + k; break;
+            }
+          } catch (e) {}
+        }
+      } catch (e) {}
+      if (found) break;
+    }
+    // Also walk video element
+    if (!found) {
+      var vEl = document.querySelector('video');
+      if (vEl) {
+        for (var vk in vEl) {
+          try {
+            if (looksLikeHls(vEl[vk])) { found = vEl[vk]; foundVia = 'video.' + vk; break; }
+          } catch (e) {}
+        }
+      }
+    }
+    console.log('[kp2] deepProbeHls', { found: !!found, via: foundVia });
+    if (found) hookHlsInstance(found, 'deepProbe:' + foundVia);
   }
 
   function patchHls() {
@@ -1890,7 +2174,30 @@
     if (window.__kp_player_listener) return;
     window.__kp_player_listener = true;
 
+    // v2.1: при старте плеера применяем сохранённый voiceover автоматически —
+    // юзер видит уже выбранную дорожку, без клика. На каждый старт серии
+    // воспроизведение начинается с дефолтной дорожки плеера, поэтому
+    // переключаем со ступенчатой задержкой (avplay/hls — оба требуют, чтобы
+    // плейлист был распарсен).
+    var applyPendingVoiceover = function() {
+      var vs = window.__kp_pending_voiceovers;
+      if (!vs || !vs.length) return;
+      var sel;
+      for (var i = 0; i < vs.length; i++) if (vs[i].selected) { sel = vs[i]; break; }
+      if (!sel) return;
+      try {
+        applyVoiceToActivePlayer(sel.kp_audio, sel.kp_index);
+      } catch (e) {
+        console.log('[kp2] applyPendingVoiceover err', String(e));
+      }
+    };
+
     var apply = function() {
+      setTimeout(applyPendingVoiceover,  800);
+      setTimeout(applyPendingVoiceover, 2000);
+      setTimeout(applyPendingVoiceover, 4000);
+      // Старая логика hls-side — оставляем как страховку для случаев
+      // когда voiceovers не построились или плеер ведёт себя необычно.
       setTimeout(applyKinopubVoice,  600);
       setTimeout(applyKinopubVoice, 1500);
       setTimeout(applyKinopubVoice, 3000);
