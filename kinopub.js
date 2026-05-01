@@ -1,26 +1,113 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.15
+ * Kinopub plugin for Lampa  v1.5.0
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
- * заменён только источник (kpapi). Авторизация временно отключена:
- * токен хардкодится; OAuth/паста-форма будут добавлены позже.
+ * заменён только источник (kpapi). Авторизация — OAuth2 device-flow
+ * (kinopub.tv/device-style), токены живут в Lampa.Storage с авто-refresh.
  */
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.15';
+  var PLUGIN_VERSION = '1.5.0';
 
-  // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
-  // Время жизни ~24ч, обновлять отсюда https://kino.pub/api → console snippet.
-  var kp_token = 'y5yewmq01148rdz8n173sc48o7q2i4os';
+  /* ---------- авторизационные креды и эндпойнты ---------- */
+  var api_url   = 'https://api.srvkp.com/v1/';
+  var oauth_url = 'https://api.srvkp.com/oauth2/';
+  // Креды из официального PWA kinopub. xbmc-секрет старого Kodi-аддона
+  // отозван, эта пара — рабочая на момент v1.5.0.
+  var KP_CLIENT_ID     = 'xbmc';
+  var KP_CLIENT_SECRET = 'cgg3gtifu46urtfp2zp1nqtba0k2ezxh';
 
-  var api_url  = 'https://api.service-kp.com/v1/';
+  var kp_token         = Lampa.Storage.get('kp_token',         '') || '';
+  var kp_refresh_token = Lampa.Storage.get('kp_refresh_token', '') || '';
+
+  // Модалка авторизации и поллинг — module-level, чтобы destroy() компонента
+  // мог их прибить если активити закрыли посреди процесса.
+  var modalopen = false;
+  var ping_auth;
 
   /* ---------- helpers ---------- */
 
   function bearerHeaders() {
-    return { Authorization: 'Bearer ' + kp_token };
+    return kp_token ? { Authorization: 'Bearer ' + kp_token } : {};
+  }
+
+  function urlEncodeForm(obj) {
+    var pairs = [];
+    for (var k in obj) if (Object.prototype.hasOwnProperty.call(obj, k)) {
+      pairs.push(encodeURIComponent(k) + '=' + encodeURIComponent(obj[k]));
+    }
+    return pairs.join('&');
+  }
+
+  /**
+   * Refresh access_token через сохранённый refresh_token.
+   * Вызывается автоматически из apiGet когда вернулся 401.
+   * При успехе обновляем оба токена в памяти и Storage.
+   * При неудаче — стираем оба, плагин при следующем запуске покажет device-flow.
+   */
+  /**
+   * Обёртка над network.silent для kinopub-API с автоматическим refresh
+   * при 401: один retry с подсасыванием нового access_token. Если refresh
+   * тоже не удался (refresh_token истёк) — стираем токены и отдаём ошибку
+   * наверх; в kpapi() при !kp_token откроется device-flow модалка.
+   */
+  function apiSilent(network, url, success, error) {
+    var retried = false;
+    function send() {
+      network.silent(url, function(json) { success && success(json); }, function(xhr, code) {
+        if (code === 401 && !retried && kp_refresh_token) {
+          retried = true;
+          refreshKpToken(send, function() { error && error(xhr, code); });
+        } else {
+          if (code === 401) {
+            // refresh не помог — токен мёртв окончательно
+            kp_token = '';
+            Lampa.Storage.set('kp_token', '');
+          }
+          error && error(xhr, code);
+        }
+      }, false, { headers: bearerHeaders() });
+    }
+    send();
+  }
+
+  function refreshKpToken(onOk, onFail) {
+    if (!kp_refresh_token) { onFail && onFail(); return; }
+    var body = urlEncodeForm({
+      grant_type:    'refresh_token',
+      client_id:     KP_CLIENT_ID,
+      client_secret: KP_CLIENT_SECRET,
+      refresh_token: kp_refresh_token
+    });
+    var net2 = new Lampa.Reguest();
+    net2.timeout(15000);
+    net2.silent(oauth_url + 'token', function(json) {
+      if (json && json.access_token) {
+        kp_token = json.access_token;
+        Lampa.Storage.set('kp_token', kp_token);
+        if (json.refresh_token) {
+          kp_refresh_token = json.refresh_token;
+          Lampa.Storage.set('kp_refresh_token', kp_refresh_token);
+        }
+        if (json.expires_in) Lampa.Storage.set('kp_token_expires', Date.now() + json.expires_in * 1000);
+        onOk && onOk();
+      } else {
+        kp_token = ''; kp_refresh_token = '';
+        Lampa.Storage.set('kp_token', '');
+        Lampa.Storage.set('kp_refresh_token', '');
+        onFail && onFail();
+      }
+    }, function() {
+      kp_token = ''; kp_refresh_token = '';
+      Lampa.Storage.set('kp_token', '');
+      Lampa.Storage.set('kp_refresh_token', '');
+      onFail && onFail();
+    }, body, {
+      dataType: 'json',
+      headers:  { 'Content-Type': 'application/x-www-form-urlencoded' }
+    });
   }
 
   function normalizeString(str) {
@@ -139,6 +226,110 @@
       voice_name: ''
     };
 
+    /* ---------- авторизация ---------- */
+
+    // Если токена ещё нет — поднимаем модалку device-flow (как у filmix.js).
+    // 1) POST /oauth2/device (grant_type=client_credentials) → {code, user_code, verification_uri}
+    // 2) Показываем user_code, юзер вводит на kino.pub/pin
+    // 3) Поллим /oauth2/device (grant_type=device_token, code=...) → {access_token, refresh_token}
+    // 4) Сохраняем токены и перезагружаем страницу — плагин запускается уже авторизованным.
+    if (!kp_token) {
+      modalopen = true;
+      var user_code   = '';
+      var device_code = '';
+      var verify_url  = 'https://kino.pub/pin';
+
+      var modal = $(
+        '<div>' +
+        '<div class="broadcast__text">' + Lampa.Lang.translate('kp_modal_text').replace('{url}', verify_url) + '</div>' +
+        '<div class="broadcast__device selector" style="text-align: center; background-color: darkslategrey; color: white;">' +
+          Lampa.Lang.translate('kp_modal_wait') + '...' +
+        '</div>' +
+        '<br>' +
+        '<div class="broadcast__scan"><div></div></div>' +
+        '</div>'
+      );
+
+      var openModal = function() {
+        var contrl = Lampa.Controller.enabled().name;
+        Lampa.Modal.open({
+          title: 'Kinopub',
+          html:  modal,
+          onBack: function() {
+            Lampa.Modal.close();
+            clearInterval(ping_auth);
+            modalopen = false;
+            Lampa.Controller.toggle(contrl);
+          },
+          onSelect: function() {
+            // OK на коде → копирование в буфер
+            if (user_code) {
+              Lampa.Utils.copyTextToClipboard(user_code, function() {
+                Lampa.Noty.show(Lampa.Lang.translate('copy_secuses'));
+              }, function() {
+                Lampa.Noty.show(Lampa.Lang.translate('copy_fail'));
+              });
+            }
+          }
+        });
+      };
+
+      // Поллинг: ждём пока юзер активирует код на сайте
+      ping_auth = setInterval(function() {
+        if (!device_code) return;
+        var body = urlEncodeForm({
+          grant_type:    'device_token',
+          client_id:     KP_CLIENT_ID,
+          client_secret: KP_CLIENT_SECRET,
+          code:          device_code
+        });
+        network.silent(oauth_url + 'device', function(json) {
+          if (json && json.access_token) {
+            clearInterval(ping_auth);
+            Lampa.Modal.close();
+            modalopen = false;
+            Lampa.Storage.set('kp_token', json.access_token);
+            if (json.refresh_token) Lampa.Storage.set('kp_refresh_token', json.refresh_token);
+            if (json.expires_in)    Lampa.Storage.set('kp_token_expires', Date.now() + json.expires_in * 1000);
+            window.location.reload();
+          }
+          // прочее — ждём, юзер ещё не ввёл код
+        }, function() { /* 4xx до активации — нормально, продолжаем поллинг */ }, body, {
+          dataType: 'json',
+          headers:  { 'Content-Type': 'application/x-www-form-urlencoded' }
+        });
+      }, 5000);
+
+      // Запрос device-кода
+      var initBody = urlEncodeForm({
+        grant_type:    'client_credentials',
+        client_id:     KP_CLIENT_ID,
+        client_secret: KP_CLIENT_SECRET
+      });
+      network.quiet(oauth_url + 'device', function(found) {
+        if (found && found.code && found.user_code) {
+          device_code = found.code;
+          user_code   = found.user_code;
+          if (found.verification_uri) {
+            verify_url = found.verification_uri;
+            modal.find('.broadcast__text').text(Lampa.Lang.translate('kp_modal_text').replace('{url}', verify_url));
+          }
+          modal.find('.broadcast__device').text(user_code);
+          if (!$('.modal').length) openModal();
+        } else {
+          Lampa.Noty.show(Lampa.Lang.translate('kp_auth_error'));
+        }
+      }, function(a, c) {
+        Lampa.Noty.show(Lampa.Lang.translate('kp_auth_error') + (c ? ' (' + c + ')' : ''));
+      }, initBody, {
+        dataType: 'json',
+        headers:  { 'Content-Type': 'application/x-www-form-urlencoded' }
+      });
+
+      component.loading(false);
+      return;
+    }
+
     /* ---------- API source-методы ---------- */
 
     this.search = function(_object, sim) {
@@ -157,7 +348,7 @@
       var url   = api_url + 'items/search?q=' + encodeURIComponent(query) + '&perpage=20';
 
       network.clear();
-      network.silent(url, function(json) {
+      apiSilent(network, url, function(json) {
         var items = (json && json.items) || [];
 
         var card = pickKpCard(items, { year: year, orig: orig, ru: ru, imdb: imdb, kpid: kpid });
@@ -170,13 +361,8 @@
           component.loading(false);
         } else component.doesNotAnswer();
       }, function(a, c) {
-        if (c == 401) {
-          // токен умер — стираем и просим войти заново
-          kp_token = '';
-          Lampa.Storage.set('kp_token', '');
-        }
         component.doesNotAnswer();
-      }, false, { headers: bearerHeaders() });
+      });
     };
 
     /**
@@ -257,15 +443,14 @@
       var url = api_url + 'items/' + itemId;
       network.clear();
       network.timeout(10000);
-      network.silent(url, function(found) {
+      apiSilent(network, url, function(found) {
         if (found && found.item) {
           success(found.item);
           component.loading(false);
         } else component.doesNotAnswer();
-      }, function(a, c) {
-        if (c == 401) { kp_token = ''; Lampa.Storage.set('kp_token', ''); }
+      }, function() {
         component.doesNotAnswer();
-      }, false, { headers: bearerHeaders() });
+      });
     };
 
     this.extendChoice = function(saved) {
@@ -1173,6 +1358,9 @@
       files.destroy();
       scroll.destroy();
       if (source && source.destroy) source.destroy();
+      // если активити закрыли в момент device-flow — прибиваем модалку и поллинг
+      if (modalopen) { modalopen = false; try { Lampa.Modal.close(); } catch (e) {} }
+      clearInterval(ping_auth);
     };
   }
 
@@ -1467,11 +1655,24 @@
     } catch (e) {}
   }
 
+  /**
+   * Лёгкая проверка токена при старте: дёргаем /v1/user. Если 401 и есть
+   * refresh_token — apiSilent сам обновит и повторит. Если 401 без refresh —
+   * стираем; следующий заход в карточку покажет device-flow.
+   */
+  function checkKpToken() {
+    if (!kp_token) return;
+    var net = new Lampa.Reguest();
+    net.timeout(8000);
+    apiSilent(net, api_url + 'user', function() {}, function() {});
+  }
+
   function startPlugin() {
     window.online_kinopub = true;
     sanitizeKpStorage();  // one-time cleanup от циклов из старых сборок
     ensurePatchHls();     // дождаться window.Hls и подменить конструктор
     bindPlayerListener(); // страховка на повторное применение озвучки
+    checkKpToken();       // обновить access_token если истёк
 
     var manifest = {
       type:        'video',
@@ -1511,7 +1712,22 @@
       online_clear_all_timecodes: { ru: 'Очистить все тайм-коды', en: 'Clear all timecodes', uk: 'Очистити тайм-коди' },
       online_balanser_dont_work:  { ru: 'Поиск не дал результатов', en: 'No results', uk: 'Немає результатів' },
       online_specials: { ru: 'Спецвыпуски', en: 'Specials', uk: 'Спецвипуски' },
-      helper_online_file: { ru: 'Удерживайте «ОК» для контекстного меню', en: 'Hold OK for context menu', uk: 'Утримуйте OK' }
+      helper_online_file: { ru: 'Удерживайте «ОК» для контекстного меню', en: 'Hold OK for context menu', uk: 'Утримуйте OK' },
+
+      kp_modal_text: {
+        ru: 'Откройте {url} и введите код. Окно закроется автоматически.',
+        en: 'Open {url} and enter the code. This window will close automatically.',
+        uk: 'Відкрийте {url} і введіть код. Вікно закриється автоматично.'
+      },
+      kp_modal_wait:    { ru: 'Получаем код',          en: 'Getting the code',     uk: 'Отримуємо код' },
+      kp_auth_error:    { ru: 'Ошибка авторизации',     en: 'Authorization error',  uk: 'Помилка авторизації' },
+      kp_logged_in:     { ru: 'Авторизован',            en: 'Signed in',            uk: 'Авторизовано' },
+      kp_not_logged_in: { ru: 'Не авторизован',         en: 'Not signed in',        uk: 'Не авторизовано' },
+      kp_logout:        { ru: 'Выйти',                  en: 'Sign out',             uk: 'Вийти' },
+      kp_logout_desc:   { ru: 'Удалить токен и пройти авторизацию заново', en: 'Remove token and re-authorize', uk: 'Видалити токен та авторизуватися заново' },
+      kp_logged_out:    { ru: 'Вы вышли',               en: 'Signed out',           uk: 'Вихід виконано' },
+      copy_secuses:     { ru: 'Код скопирован',         en: 'Code copied',          uk: 'Код скопійовано' },
+      copy_fail:        { ru: 'Ошибка копирования',     en: 'Copy error',           uk: 'Помилка копіювання' }
     });
 
     Lampa.Template.add('online_prestige_css', "<style>.online-prestige{position:relative;border-radius:.3em;background-color:rgba(0,0,0,0.3);display:flex}.online-prestige__body{padding:1.2em;line-height:1.3;flex-grow:1;position:relative}.online-prestige__img{position:relative;width:13em;flex-shrink:0;min-height:8.2em}.online-prestige__img>img{position:absolute;top:0;left:0;width:100%;height:100%;object-fit:cover;border-radius:.3em;opacity:0;transition:opacity .3s}.online-prestige__img--loaded>img{opacity:1}@media screen and (max-width:480px){.online-prestige__img{width:7em;min-height:6em}}.online-prestige__folder{padding:1em;flex-shrink:0}.online-prestige__folder>svg{width:4.4em !important;height:4.4em !important}.online-prestige__viewed{position:absolute;top:1em;left:1em;background:rgba(0,0,0,0.45);border-radius:100%;padding:.25em}.online-prestige__viewed>svg{width:1.5em !important;height:1.5em !important}.online-prestige__episode-number{position:absolute;top:0;left:0;right:0;bottom:0;display:flex;align-items:center;justify-content:center;font-size:2em}.online-prestige__loader{position:absolute;top:50%;left:50%;width:2em;height:2em;margin:-1em 0 0 -1em;background:url(./img/loader.svg) no-repeat center center;background-size:contain}.online-prestige__head,.online-prestige__footer{display:flex;justify-content:space-between;align-items:center}.online-prestige__timeline{margin:.8em 0}.online-prestige__title{font-size:1.7em;overflow:hidden;text-overflow:ellipsis}.online-prestige__time{padding-left:2em}.online-prestige__info{display:flex;align-items:center}.online-prestige__quality{padding-left:1em;white-space:nowrap}.online-prestige .online-prestige-split{font-size:.8em;margin:0 1em;flex-shrink:0}.online-prestige.focus::after{content:'';position:absolute;top:-.6em;left:-.6em;right:-.6em;bottom:-.6em;border-radius:.7em;border:solid .3em #fff;z-index:-1;pointer-events:none}.online-prestige+.online-prestige{margin-top:1.5em}.online-prestige-rate{display:inline-flex;align-items:center}.online-prestige-rate>svg{width:1.3em !important;height:1.3em !important}.online-prestige-rate>span{font-weight:600;font-size:1.1em;padding-left:.7em}.online-empty__title{font-size:2em;margin-bottom:.9em}.online-empty-template{background-color:rgba(255,255,255,0.3);padding:1em;display:flex;align-items:center;border-radius:.3em}.online-empty-template>*{background:rgba(0,0,0,0.3);border-radius:.3em}.online-empty-template__ico{width:4em;height:4em;margin-right:2.4em}.online-empty-template__body{height:1.7em;width:70%}.online-empty-template+.online-empty-template{margin-top:1em}</style>");
@@ -1585,7 +1801,30 @@
     Lampa.SettingsApi.addParam({
       component: 'kinopub',
       param: { name: 'kp_version_info', type: 'static' },
-      field: { name: 'Kinopub v' + PLUGIN_VERSION, description: 'Авторизация: токен задан в коде' }
+      field: { name: 'Kinopub v' + PLUGIN_VERSION, description: '' },
+      onRender: function(el) {
+        try {
+          el.find('.settings-param__value').text(kp_token
+            ? Lampa.Lang.translate('kp_logged_in')
+            : Lampa.Lang.translate('kp_not_logged_in'));
+        } catch (e) {}
+      }
+    });
+    Lampa.SettingsApi.addParam({
+      component: 'kinopub',
+      param: { name: 'kp_logout_btn', type: 'button' },
+      field: {
+        name:        Lampa.Lang.translate('kp_logout'),
+        description: Lampa.Lang.translate('kp_logout_desc')
+      },
+      onChange: function() {
+        Lampa.Storage.set('kp_token', '');
+        Lampa.Storage.set('kp_refresh_token', '');
+        Lampa.Storage.set('kp_token_expires', 0);
+        kp_token = ''; kp_refresh_token = '';
+        Lampa.Noty.show(Lampa.Lang.translate('kp_logged_out'));
+        setTimeout(function() { window.location.reload(); }, 600);
+      }
     });
 
     if (Lampa.Manifest.app_digital >= 177) {
