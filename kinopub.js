@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.14
+ * Kinopub plugin for Lampa  v1.4.15
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.14';
+  var PLUGIN_VERSION = '1.4.15';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
   // Время жизни ~24ч, обновлять отсюда https://kino.pub/api → console snippet.
@@ -294,32 +294,10 @@
       results = null;
     };
 
-    /**
-     * Перерисовать список серий с актуальной озвучкой из cache (saveKinopubVoice
-     * мог обновить storage в момент когда плеер был открыт). choice резетить НЕ
-     * нужно — только подтянуть свежие voice_*-поля.
-     *
-     * НЕ используем Lampa.Arrays.extend(choice, savedRef, true) — savedRef
-     * фактически === choice (saveChoice писал по ссылке), и deep-extend
-     * создаёт самореференцию → JSON.stringify падает с RangeError.
-     */
-    this.refresh = function() {
-      if (!results) return;
-      try {
-        var key  = 'online_choice_' + balanser;
-        var data = Lampa.Storage.cache(key, 3000, {});
-        var id   = (object.movie && object.movie.id);
-        var saved = (id != null && data[id]) ? data[id] : null;
-        if (saved && saved !== choice) {
-          ['voice_lang','voice_author','voice_type','voice_name'].forEach(function(k) {
-            if (k in saved) choice[k] = saved[k];
-          });
-        }
-      } catch (e) {}
-      component.reset();
-      filter();
-      append(filtred());
-    };
+    // refresh() удалён в v1.4.15 — он триггерил рекурсию через empty()
+    // (см. комментарий в component.start). Подписи озвучки обновляются
+    // только при перезаходе в карточку. Дальнейший on-the-fly refresh —
+    // отдельная задача, через корректное событие.
 
     function success(item) {
       results = item;
@@ -1165,11 +1143,11 @@
     this.start = function() {
       if (Lampa.Activity.active().activity !== this.activity) return;
       if (!initialized) { initialized = true; this.initialize(); }
-      else {
-        // re-activation (вернулись из плеера / другой активити) —
-        // перерисовываем список с актуальным выбором озвучки из cache.
-        if (source && source.refresh) source.refresh();
-      }
+      // ВАЖНО: не зовём source.refresh() из start() — append → draw → empty →
+      // loading(false) → activity.toggle() → start() = бесконечный цикл,
+      // если filtred() вдруг возвращает пустой список (например при
+      // временно повреждённом cache). Refresh подписей сейчас работает
+      // только через перезаход в карточку — это безопаснее.
       Lampa.Background.immediately(Lampa.Utils.cardImgBackgroundBlur(object.movie));
       Lampa.Controller.add('content', {
         toggle: function() {
@@ -1307,12 +1285,27 @@
     try {
       var key  = 'online_choice_kpapi';
       var data = Lampa.Storage.cache(key, 3000, {});
-      if (!data[item_id]) data[item_id] = {};
-      data[item_id].voice_lang   = voice.lang;
-      data[item_id].voice_author = voice.author;
-      data[item_id].voice_type   = voice.type;
-      data[item_id].voice_name   = voice.name;
-      Lampa.Storage.set(key, data);
+      // Чистим этот item_id от любого мусора — пишем только примитивы.
+      data[item_id] = {
+        season:        (data[item_id] && typeof data[item_id].season       === 'number') ? data[item_id].season       : 0,
+        voice:         (data[item_id] && typeof data[item_id].voice        === 'number') ? data[item_id].voice        : 0,
+        voice_id:      (data[item_id] && typeof data[item_id].voice_id     === 'number') ? data[item_id].voice_id     : 0,
+        episodes_view: (data[item_id] && data[item_id].episodes_view && typeof data[item_id].episodes_view === 'object')
+                       ? JSON.parse(JSON.stringify(data[item_id].episodes_view)) : {},
+        movie_view:    (data[item_id] && typeof data[item_id].movie_view   === 'string') ? data[item_id].movie_view   : '',
+        voice_lang:    voice.lang,
+        voice_author:  voice.author,
+        voice_type:    voice.type,
+        voice_name:    voice.name
+      };
+      // Защита от циклов в ОСТАЛЬНЫХ item_id (если sanitize по какой-то
+      // причине не успел или они снова появились) — round-trip всё.
+      var clean;
+      try { clean = JSON.parse(JSON.stringify(data)); }
+      catch (cycleErr) {
+        clean = {}; clean[item_id] = data[item_id]; // fallback: только текущий
+      }
+      Lampa.Storage.set(key, clean);
     } catch (e) {}
   }
 
@@ -1446,8 +1439,37 @@
     } catch (e) {}
   }
 
+  /**
+   * Старые версии плагина (v1.4.13) ловили баг: deep-extend choice объекта
+   * самим собой создавал самореференцию, и она попадала в Lampa.Storage.
+   * После этого ЛЮБАЯ запись в этот ключ — JSON.stringify падает с RangeError.
+   * Эта функция round-trip'ит каждую запись через JSON: то что не сериализуется
+   * (= цикл) — отбрасывается. Один раз на старте плагина.
+   */
+  function sanitizeKpStorage() {
+    try {
+      var key   = 'online_choice_kpapi';
+      var data  = Lampa.Storage.get(key, {}) || {};
+      var clean = {};
+      var dropped = 0;
+      for (var k in data) {
+        if (!Object.prototype.hasOwnProperty.call(data, k)) continue;
+        try {
+          clean[k] = JSON.parse(JSON.stringify(data[k]));
+        } catch (e) {
+          dropped++;
+        }
+      }
+      if (dropped > 0) {
+        try { console.warn('[kinopub] sanitized cache, dropped', dropped, 'cyclic entries'); } catch (e) {}
+      }
+      Lampa.Storage.set(key, clean);
+    } catch (e) {}
+  }
+
   function startPlugin() {
     window.online_kinopub = true;
+    sanitizeKpStorage();  // one-time cleanup от циклов из старых сборок
     ensurePatchHls();     // дождаться window.Hls и подменить конструктор
     bindPlayerListener(); // страховка на повторное применение озвучки
 
