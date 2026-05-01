@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.0
+ * Kinopub plugin for Lampa  v1.4.1
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.0';
+  var PLUGIN_VERSION = '1.4.1';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
   var kp_token = 'owe26z7w0ezk6idutpi4mta0th3ouwcd';
@@ -108,23 +108,21 @@
       object    = _object;
 
       var year  = parseInt((object.movie.release_date || object.movie.first_air_date || '0000').slice(0, 4));
-      var orig  = object.movie.original_name || object.movie.original_title;
+      var orig  = object.movie.original_name  || object.movie.original_title || '';
+      var ru    = object.movie.name           || object.movie.title          || '';
+      var imdb  = (object.movie.imdb_id || '').toString().replace(/^tt/, '');
+      var kpid  = object.movie.kinopoisk_id ? String(object.movie.kinopoisk_id) : '';
       var url   = api_url + 'items/search?q=' + encodeURIComponent(query) + '&perpage=20';
 
       network.clear();
       network.silent(url, function(json) {
         var items = (json && json.items) || [];
-        var cards = items.filter(function(c) {
-          var y = parseInt(c.year) || 0;
-          return Math.abs(y - year) <= 1;
-        });
-        var card = cards.find(function(c) {
-          return c.year == year && normalizeString(c.title || c.subname) == normalizeString(orig);
-        });
 
-        if (!card && cards.length == 1) card = cards[0];
+        var card = pickKpCard(items, { year: year, orig: orig, ru: ru, imdb: imdb, kpid: kpid });
+
         if (card) _this.find(card.id);
         else if (items.length) {
+          // Фоллбэк: всё-таки показываем similars, если ни один из стратегий не выбрал
           wait_similars = true;
           component.similars(items.map(toSimilar));
           component.loading(false);
@@ -138,6 +136,67 @@
         component.doesNotAnswer();
       }, false, { headers: bearerHeaders() });
     };
+
+    /**
+     * Однозначно определить карточку kinopub под текущий тайтл из Lampa.
+     * Возвращает item или null.
+     *
+     * Приоритет совпадения (от наиболее надёжного к наименее):
+     *  1) imdb_id
+     *  2) kinopoisk_id
+     *  3) точный год + название (RU или ORIG) пересекается с title/subname
+     *  4) точный год + единственная карточка с таким годом
+     *  5) ±1 год + единственная карточка
+     *  6) точный год + первая карточка (из нескольких — берём верхнюю)
+     */
+    function pickKpCard(items, ctx) {
+      if (!items || !items.length) return null;
+
+      // 1) IMDb ID
+      if (ctx.imdb) {
+        var byImdb = items.find(function(c) {
+          return c.imdb && String(c.imdb).replace(/^tt/, '') === ctx.imdb;
+        });
+        if (byImdb) return byImdb;
+      }
+
+      // 2) Kinopoisk ID
+      if (ctx.kpid) {
+        var byKp = items.find(function(c) {
+          return c.kinopoisk && String(c.kinopoisk) === ctx.kpid;
+        });
+        if (byKp) return byKp;
+      }
+
+      // 3) Год + название
+      var nOrig = normalizeString(ctx.orig);
+      var nRu   = normalizeString(ctx.ru);
+      var exact = items.filter(function(c) { return c.year == ctx.year; });
+
+      if (exact.length) {
+        if (nOrig || nRu) {
+          var byTitle = exact.find(function(c) {
+            var blob = normalizeString((c.title || '') + (c.subname || ''));
+            return (nOrig && blob.indexOf(nOrig) !== -1) ||
+                   (nRu   && blob.indexOf(nRu)   !== -1);
+          });
+          if (byTitle) return byTitle;
+        }
+        // 4) Единственный с точным годом — берём
+        if (exact.length === 1) return exact[0];
+        // 6) Несколько с точным годом — берём первый (kinopub отдаёт наиболее релевантные сверху)
+        return exact[0];
+      }
+
+      // 5) ±1 год — единственный
+      var near = items.filter(function(c) {
+        var y = parseInt(c.year) || 0;
+        return ctx.year && Math.abs(y - ctx.year) <= 1;
+      });
+      if (near.length === 1) return near[0];
+
+      return null;
+    }
 
     function toSimilar(it) {
       return {
