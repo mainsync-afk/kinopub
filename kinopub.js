@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.2
+ * Kinopub plugin for Lampa  v1.4.3
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.2';
+  var PLUGIN_VERSION = '1.4.3';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
   var kp_token = 'owe26z7w0ezk6idutpi4mta0th3ouwcd';
@@ -62,16 +62,31 @@
   }
 
   function buildQualityMap(files) {
-    var qmap = {};
+    // Строим две версии карты: HLS (для адаптивного стриминга) и HTTP (прямые mp4).
+    // У kinopub бывает что url.hls4 == один master-плейлист для всех качеств —
+    // тогда переключение в плеере ничего не делает. Для qmap в этом случае
+    // отдаём http (он гарантированно per-quality), для стрима оставляем hls.
+    var qHls = {}, qHttp = {};
     var qarr = [];
     (files || []).forEach(function(f) {
       var n = qNum(f.quality);
-      var u = fileUrl(f);
-      if (n && u && !qmap[n + 'p']) {
-        qmap[n + 'p'] = u;
-        qarr.push(n);
-      }
+      if (!n || !f.url) return;
+      var key  = n + 'p';
+      var hls  = f.url.hls4 || f.url.hls || '';
+      var http = f.url.http || '';
+      if (!qHls[key]  && hls)  qHls[key]  = hls;
+      if (!qHttp[key] && http) qHttp[key] = http;
+      if (qarr.indexOf(n) === -1) qarr.push(n);
     });
+
+    // Все ли HLS-урлы одинаковые? (master-плейлист вместо variant)
+    var hlsKeys = Object.keys(qHls);
+    var uniqueHls = {};
+    hlsKeys.forEach(function(k) { uniqueHls[qHls[k]] = true; });
+    var hlsAllSame = hlsKeys.length > 1 && Object.keys(uniqueHls).length === 1;
+
+    var qmap = (hlsAllSame && Object.keys(qHttp).length > 0) ? qHttp
+             : (hlsKeys.length > 0 ? qHls : qHttp);
     return { qmap: qmap, qarr: qarr };
   }
 
@@ -330,78 +345,62 @@
       if (!item) return;
 
       if (item.seasons && item.seasons.length) {
-        // Сериал. У kinopub URL внутри MKV содержит все аудиодорожки,
-        // переключение озвучки в плеере не меняет файл. Поэтому voice
-        // у нас информационный — собираем все уникальные имена дорожек.
-        var voices = [];
-        item.seasons.forEach(function(s) {
-          (s.episodes || []).forEach(function(ep) {
-            (ep.audios || []).forEach(function(a, ai) {
-              var name = audioName(a, ai);
-              if (voices.indexOf(name) === -1) voices.push(name);
-            });
-          });
-        });
-        if (!voices.length) voices.push('');
-
+        // Сериал. kinopub отдаёт MKV со всеми аудио-дорожками внутри одного файла —
+        // переключение озвучки в нашем фильтре не меняет URL, поэтому фильтр для
+        // сериалов мы вообще не показываем. Дорожки выбираются в самом плеере.
         var sortedSeasons = sortSeasonsForDisplay(item.seasons);
         var tmdbCounts    = (results && results.__tmdb_counts) || {};
 
-        voices.forEach(function(v, vi) {
-          var transl_id   = vi + 1;
-          var seasonsList = [];
-          var specials    = [];
-          var seasonIdx   = 0;
+        var transl_id   = 1;
+        var seasonsList = [];
+        var specials    = [];
+        var seasonIdx   = 0;
 
-          sortedSeasons.forEach(function(season) {
-            var num = parseInt(season.number) || 0;
+        sortedSeasons.forEach(function(season) {
+          var num = parseInt(season.number) || 0;
 
-            if (num === 0) {
-              // явный сезон 0 целиком в спецвыпуски
-              (season.episodes || []).forEach(function(ep) {
-                var entry = makeEpisodeEntry(num, ep, transl_id);
-                if (entry) specials.push(entry);
-              });
-              return;
-            }
-
-            var tmdbMax = tmdbCounts[num];
-            var picks   = [];
+          if (num === 0) {
+            // явный сезон 0 целиком в спецвыпуски
             (season.episodes || []).forEach(function(ep) {
               var entry = makeEpisodeEntry(num, ep, transl_id);
-              if (!entry) return;
-              if (tmdbMax != null && ep.number > tmdbMax) {
-                // kinopub докинул в сезон лишнее → специал
-                specials.push(entry);
-              } else {
-                picks.push(entry);
-              }
+              if (entry) specials.push(entry);
             });
-
-            seasonIdx++;
-            seasonsList.push({
-              id:          seasonIdx,                // 1-based по позиции в filter_items.season
-              comment:     num + ' ' + Lampa.Lang.translate('torrent_serial_season'),
-              folder:      picks,
-              translation: transl_id
-            });
-          });
-
-          if (specials.length) {
-            seasonIdx++;
-            seasonsList.push({
-              id:          seasonIdx,
-              comment:     Lampa.Lang.translate('online_specials'),
-              folder:      specials,
-              translation: transl_id,
-              specials:    true
-            });
+            return;
           }
 
-          extract[transl_id] = { json: seasonsList, file: '', voice_name: v };
+          var tmdbMax = tmdbCounts[num];
+          var picks   = [];
+          (season.episodes || []).forEach(function(ep) {
+            var entry = makeEpisodeEntry(num, ep, transl_id);
+            if (!entry) return;
+            if (tmdbMax != null && ep.number > tmdbMax) {
+              specials.push(entry);
+            } else {
+              picks.push(entry);
+            }
+          });
+
+          seasonIdx++;
+          seasonsList.push({
+            id:          seasonIdx,                // 1-based по позиции в filter_items.season
+            comment:     num + ' ' + Lampa.Lang.translate('torrent_serial_season'),
+            folder:      picks,
+            translation: transl_id
+          });
         });
 
-        results.__voices = voices;
+        if (specials.length) {
+          seasonIdx++;
+          seasonsList.push({
+            id:          seasonIdx,
+            comment:     Lampa.Lang.translate('online_specials'),
+            folder:      specials,
+            translation: transl_id,
+            specials:    true
+          });
+        }
+
+        extract[transl_id] = { json: seasonsList, file: '', voice_name: '' };
       }
       else if (item.videos && item.videos.length) {
         // Фильм / multi-часть
@@ -490,15 +489,8 @@
           }
         });
         if (hasSpecials) filter_items.season.push(Lampa.Lang.translate('online_specials'));
-        if (results.__voices && results.__voices.length) {
-          results.__voices.forEach(function(v, idx) {
-            if (!v) return;
-            if (filter_items.voice.indexOf(v) === -1) {
-              filter_items.voice.push(v);
-              filter_items.voice_info.push({ id: idx + 1 });
-            }
-          });
-        }
+        // Озвучку для сериалов не показываем — внутри MKV уже все аудио-дорожки,
+        // и переключение этого фильтра не меняет URL. Дорожки выбираются в плеере.
       } else if (results.videos && results.videos.length) {
         for (var transl_id in extract) {
           var name = extract[transl_id].translation || '';
