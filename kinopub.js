@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.10
+ * Kinopub plugin for Lampa  v1.4.11
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.10';
+  var PLUGIN_VERSION = '1.4.11';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
   // Время жизни ~24ч, обновлять отсюда https://kino.pub/api → console snippet.
@@ -1190,7 +1190,11 @@
 
   function applyKinopubVoice() {
     var voice = window.__kp_pending_voice;
-    if (!voice || (!voice.lang && !voice.author && voice.index == null)) return;
+    // Если ни lang ни author не заданы — НЕ трогаем плеер. Иначе уйдём в
+    // index-фоллбэк и принудительно поставим первый трек, перебив дефолт
+    // плеера. (Это и был баг: после reopen карточки без сохранённой озвучки
+    // мы били в track 0.)
+    if (!voice || (!voice.lang && !voice.author)) return;
 
     // hls-инстанс может лежать в трёх разных местах в зависимости от того,
     // успел ли отработать наш monkey-patch и как Lampa подхватила Hls.
@@ -1260,11 +1264,14 @@
           if (EV && EV.MANIFEST_PARSED) {
             inst.on(EV.MANIFEST_PARSED, function() { setTimeout(applyKinopubVoice, 200); });
           }
-          // Юзер сменил дорожку в OSD плеера → запоминаем для следующих серий
+          // Юзер сменил дорожку в OSD плеера → запоминаем для следующих серий.
+          // hls.js разных версий зовёт колбэк (event, data) ИЛИ просто (data),
+          // поэтому опираемся на inst.audioTrack — он уже выставлен в новый
+          // индекс к моменту срабатывания события.
           if (EV && EV.AUDIO_TRACK_SWITCHED) {
-            inst.on(EV.AUDIO_TRACK_SWITCHED, function(_evt, data) {
+            inst.on(EV.AUDIO_TRACK_SWITCHED, function() {
               try {
-                var id = (data && data.id != null) ? data.id : inst.audioTrack;
+                var id = inst.audioTrack;
                 var track = inst.audioTracks && inst.audioTracks[id];
                 if (track) saveKinopubVoice(track);
               } catch (e) {}
