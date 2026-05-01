@@ -1,0 +1,13 @@
+# local diagnostic logs
+logs/
+*.log
+
+# os / editor noise
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# scratch files
+*.tmp
+*.bak
