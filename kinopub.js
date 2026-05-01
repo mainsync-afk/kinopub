@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.9
+ * Kinopub plugin for Lampa  v1.4.10
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.9';
+  var PLUGIN_VERSION = '1.4.10';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
   // Время жизни ~24ч, обновлять отсюда https://kino.pub/api → console snippet.
@@ -528,17 +528,11 @@
         });
         if (hasSpecials) filter_items.season.push(Lampa.Lang.translate('online_specials'));
 
-        // Озвучки. URL един для всех — фильтр меняет только метаданные,
-        // которые потом плеер использует через hls.audioTrack.
-        if (results.__voices && results.__voices.length) {
-          results.__voices.forEach(function(v, idx) {
-            var label = v.name || ('Audio ' + (idx + 1));
-            if (filter_items.voice.indexOf(label) === -1) {
-              filter_items.voice.push(label);
-              filter_items.voice_info.push({ id: 1, voice: v });
-            }
-          });
-        }
+        // Озвучку для сериалов в сайдбар не выводим — выбор живёт ИСКЛЮЧИТЕЛЬНО
+        // в OSD плеера (kinopub отдаёт один MKV/HLS со всеми треками внутри).
+        // Изменения юзера в плеере перехватываются Hls.Events.AUDIO_TRACK_SWITCHED
+        // → saveKinopubVoice → cache. Следующая серия / новая сессия применяют
+        // тот же выбор автоматически через applyKinopubVoice.
       } else if (results.videos && results.videos.length) {
         for (var transl_id in extract) {
           var name = extract[transl_id].translation || '';
@@ -564,8 +558,12 @@
       var out = [];
 
       if (results && results.seasons && results.seasons.length) {
-        var voiceMeta = (filter_items.voice_info[choice.voice] && filter_items.voice_info[choice.voice].voice) || null;
-        var voiceLabel = filter_items.voice[choice.voice] || (voiceMeta && voiceMeta.name) || '';
+        // Озвучка живёт в choice (saved через saveKinopubVoice из плеера).
+        // Если ничего не сохранено — пустые поля → applyKinopubVoice no-op,
+        // плеер играет свою дефолтную дорожку.
+        var voiceLang   = choice.voice_lang   || '';
+        var voiceAuthor = choice.voice_author || '';
+        var voiceLabel  = choice.voice_name   || '';
         var element = extract[1];
         if (element && element.json) {
           for (var si in element.json) {
@@ -580,9 +578,9 @@
                   qualitys:     media.qualities_map,
                   translation:  media.translation,
                   voice_name:   voiceLabel,
-                  voice_lang:   voiceMeta ? voiceMeta.lang   : '',
-                  voice_author: voiceMeta ? voiceMeta.author : '',
-                  voice_index:  voiceMeta ? voiceMeta.index  : 0,
+                  voice_lang:   voiceLang,
+                  voice_author: voiceAuthor,
+                  voice_index:  0,
                   info:         voiceLabel
                 });
               });
@@ -641,6 +639,9 @@
         onEnter: function(item, html) {
           var extra = getFile(item, item.quality);
           if (extra.file) {
+            // Запоминаем item_id для AUDIO_TRACK_SWITCHED-листенера —
+            // он использует это чтобы сохранить выбор именно для этого тайтла.
+            try { window.__kp_current_item_id = object.movie.id; } catch (er) {}
             var playlist = [];
             var first    = toPlayElement(item);
             if (item.season) items.forEach(function(elem) { playlist.push(toPlayElement(elem)); });
@@ -1157,6 +1158,36 @@
     return -1;
   }
 
+  /**
+   * Сохранить выбранную пользователем озвучку в Lampa.Storage кэш.
+   * Вызывается из AUDIO_TRACK_SWITCHED (когда юзер меняет дорожку прямо
+   * в OSD плеера). Запоминаем по item_id — на след. серию / следующее
+   * открытие карточки applyKinopubVoice найдёт ту же дорожку.
+   */
+  function saveKinopubVoice(track) {
+    if (!track) return;
+    // hls.js audio track: { id, name, lang, default, groupId, type, ... }
+    var voice = {
+      lang:   track.lang || track.language || '',
+      author: track.name || track.label    || '',
+      index:  (track.id != null ? track.id : 0),
+      name:   track.name || track.label    || ''
+    };
+    window.__kp_pending_voice = voice;
+
+    var item_id = window.__kp_current_item_id;
+    if (!item_id) return;
+    try {
+      var key = 'online_choice_kpapi';
+      var data = Lampa.Storage.cache(key, 3000, {});
+      if (!data[item_id]) data[item_id] = {};
+      data[item_id].voice_lang   = voice.lang;
+      data[item_id].voice_author = voice.author;
+      data[item_id].voice_name   = voice.name;
+      Lampa.Storage.set(key, data);
+    } catch (e) {}
+  }
+
   function applyKinopubVoice() {
     var voice = window.__kp_pending_voice;
     if (!voice || (!voice.lang && !voice.author && voice.index == null)) return;
@@ -1222,11 +1253,22 @@
         window.__kp_hls = inst;
         try {
           var EV = target.Events;
+          // Дорожки готовы → применяем сохранённую озвучку
           if (EV && EV.AUDIO_TRACKS_UPDATED) {
             inst.on(EV.AUDIO_TRACKS_UPDATED, function() { applyKinopubVoice(); });
           }
           if (EV && EV.MANIFEST_PARSED) {
             inst.on(EV.MANIFEST_PARSED, function() { setTimeout(applyKinopubVoice, 200); });
+          }
+          // Юзер сменил дорожку в OSD плеера → запоминаем для следующих серий
+          if (EV && EV.AUDIO_TRACK_SWITCHED) {
+            inst.on(EV.AUDIO_TRACK_SWITCHED, function(_evt, data) {
+              try {
+                var id = (data && data.id != null) ? data.id : inst.audioTrack;
+                var track = inst.audioTracks && inst.audioTracks[id];
+                if (track) saveKinopubVoice(track);
+              } catch (e) {}
+            });
           }
         } catch (e) {}
         return inst;
