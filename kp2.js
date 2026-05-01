@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '2.1.2-voiceovers';
+  var PLUGIN_VERSION = '2.1.3-voiceovers';
 
   /* ============================================================
    * REMOTE DEBUG LOGGER (опционально)
@@ -1793,10 +1793,17 @@
       if (atype)  parts.push(atype);
       var label = parts.join(' • ') || lang.toUpperCase() || ('Track ' + (idx + 1));
 
-      var isSelected = (savedLang || savedAuthor || savedType)
-        ? audioMatches(audio, savedLang, savedAuthor, savedType)
-        : (idx === 0);
-      if (isSelected) anySelected = true;
+      // Только первое совпадение помечаем — иначе при дублях (RUS Кубик в Кубе
+      // обычная и AC3 идут с одинаковыми lang+author+type) ставится 2 галочки.
+      var isSelected = false;
+      if (!anySelected) {
+        if (savedLang || savedAuthor || savedType) {
+          isSelected = audioMatches(audio, savedLang, savedAuthor, savedType);
+        } else if (idx === 0) {
+          isSelected = true;
+        }
+        if (isSelected) anySelected = true;
+      }
 
       return {
         title:    label,
@@ -1817,7 +1824,21 @@
               kp_index: item.kp_index, label: item.title
             });
             saveKinopubVoice(null, audio);
-            applyVoiceToActivePlayer(audio, idx);
+            // Ретрай с backoff: на Built-in плеере в момент клика hls.audioTracks
+            // часто ещё пуст (AUDIO_TRACKS_UPDATED идёт через ~200мс после loadSource).
+            // На Tizen AVPlay — IDLE state в момент старта серии. Несколько попыток.
+            var delays = [0, 500, 1500, 3000];
+            var attempt = 0;
+            (function tryApply() {
+              var ok = applyVoiceToActivePlayer(audio, idx);
+              if (ok) return;
+              if (attempt < delays.length - 1) {
+                attempt++;
+                setTimeout(tryApply, delays[attempt]);
+              } else {
+                console.log('[kp2] voiceover.onSelect: gave up after retries', { kp_index: idx });
+              }
+            })();
           } catch (e) {
             console.log('[kp2] voiceover.onSelect err', String(e));
           }
@@ -1932,6 +1953,21 @@
             });
           } catch (e) {}
           applyKinopubVoice();
+          // v2.1.3: как только треки загрузились — применяем pre-selected
+          // voiceover (если он был помечен в buildVoiceovers как selected:true).
+          // Это закрывает race на Built-in плеере где AUDIO_TRACKS_UPDATED
+          // приходит ПОСЛЕ кликов юзера.
+          try {
+            var vs = window.__kp_pending_voiceovers;
+            if (vs && vs.length) {
+              for (var i = 0; i < vs.length; i++) {
+                if (vs[i].selected) {
+                  applyVoiceToActivePlayer(vs[i].kp_audio, vs[i].kp_index);
+                  break;
+                }
+              }
+            }
+          } catch (e) {}
         });
       }
       if (EV.MANIFEST_PARSED) {
