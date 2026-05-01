@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '2.0.4-debug';
+  var PLUGIN_VERSION = '2.0.6-debug';
 
   /* ============================================================
    * REMOTE DEBUG LOGGER (опционально)
@@ -1696,6 +1696,101 @@
   // Слушаем события плеера: на старт каждого нового стрима (новая серия,
   // переоткрытие, и т.п.) повторно применяем озвучку. Это страховка на случай
   // если monkey-patch был установлен ПОСЛЕ создания Hls-инстанса.
+  /**
+   * На Tizen наш Proxy на window.Hls срабатывает не всегда — Lampa захватывает
+   * ссылку на конструктор раньше нашего patch'а (порядок загрузки модулей
+   * отличается от десктопа). Поэтому страховочно ищем готовый инстанс через
+   * известные места в самой Lampa и через DOM-video, и подцепляемся к нему
+   * пост-фактум. Логируем всё, что нашли — это наш единственный способ узнать
+   * структуру Lampa изнутри Tizen.
+   */
+  function probeAndHookHls(reason) {
+    var hls = null;
+    var found_via = '';
+    var probes = [];
+
+    function tryPath(name, fn) {
+      try {
+        var v = fn();
+        var ok = !!v;
+        probes.push(name + '=' + (ok ? 'present' : 'null'));
+        if (ok && !hls) { hls = v; found_via = name; }
+      } catch (e) {
+        probes.push(name + '=throw');
+      }
+    }
+
+    tryPath('window.__kp_hls',          function() { return window.__kp_hls; });
+    tryPath('Lampa.PlayerVideo.hls',    function() { return Lampa.PlayerVideo && Lampa.PlayerVideo.hls; });
+    tryPath('Lampa.Player.hls',         function() { return Lampa.Player && Lampa.Player.hls; });
+    tryPath('Lampa.Player.video.hls',   function() { return Lampa.Player && Lampa.Player.video && Lampa.Player.video.hls; });
+    tryPath('Lampa.PlayerVideo.video.hls', function() { return Lampa.PlayerVideo && Lampa.PlayerVideo.video && Lampa.PlayerVideo.video.hls; });
+
+    // Probe video element: hls.js часто вешает себя на video через wreflict,
+    // sym-ключ или приватное _-свойство. Пройдёмся по всем ключам и найдём
+    // объект с .audioTracks + .levels (характерный признак Hls instance).
+    try {
+      var vEl = document.querySelector('video');
+      probes.push('video_el=' + (vEl ? 'present' : 'null'));
+      if (vEl) {
+        var keys = [];
+        for (var k in vEl) {
+          try {
+            var val = vEl[k];
+            if (val && typeof val === 'object'
+              && Array.isArray(val.audioTracks)
+              && Array.isArray(val.levels)) {
+              keys.push(k);
+              if (!hls) { hls = val; found_via = 'video.' + k; }
+            }
+          } catch (e) {}
+        }
+        if (keys.length) probes.push('video_keys=' + keys.join(','));
+      }
+    } catch (e) {}
+
+    console.log('[kp2] hls probe (' + reason + ')', { found_via: found_via, probes: probes });
+
+    // Если нашли — подцепляемся (только один раз на каждый инстанс).
+    if (hls && !hls.__kp_hooked) {
+      hls.__kp_hooked = true;
+      try {
+        var EV = (window.Hls && window.Hls.Events) || hls.constructor && hls.constructor.Events;
+        if (!EV) { console.log('[kp2] no Hls.Events available, skip hook'); return; }
+        if (EV.AUDIO_TRACKS_UPDATED) {
+          hls.on(EV.AUDIO_TRACKS_UPDATED, function() {
+            console.log('[kp2] AUDIO_TRACKS_UPDATED (probed)', {
+              n: hls.audioTracks && hls.audioTracks.length
+            });
+            applyKinopubVoice();
+          });
+        }
+        if (EV.MANIFEST_PARSED) {
+          hls.on(EV.MANIFEST_PARSED, function() { setTimeout(applyKinopubVoice, 200); });
+        }
+        if (EV.AUDIO_TRACK_SWITCHED) {
+          hls.on(EV.AUDIO_TRACK_SWITCHED, function() {
+            try {
+              var id = hls.audioTrack;
+              var track = hls.audioTracks && hls.audioTracks[id];
+              var kpAudio = window.__kp_current_audios && window.__kp_current_audios[id];
+              console.log('[kp2] AUDIO_TRACK_SWITCHED (probed)', {
+                id: id,
+                track_lang: track && track.lang,
+                track_name: track && track.name,
+                kp_audio: kpAudio
+              });
+              if (track || kpAudio) saveKinopubVoice(track, kpAudio);
+            } catch (e) {}
+          });
+        }
+        console.log('[kp2] hls hooks attached via probe', { via: found_via });
+      } catch (e) {
+        console.log('[kp2] hook failed', String(e));
+      }
+    }
+  }
+
   function bindPlayerListener() {
     if (window.__kp_player_listener) return;
     window.__kp_player_listener = true;
@@ -1709,15 +1804,28 @@
     // Канал 1: глобальный Lampa.Listener
     try {
       Lampa.Listener.follow('player', function(e) {
-        if (e && (e.type === 'start' || e.type === 'video' || e.type === 'change' || e.type === 'inited')) apply();
+        try { console.log('[kp2] player event', { type: e && e.type }); } catch (er) {}
+        if (e && (e.type === 'start' || e.type === 'video' || e.type === 'change' || e.type === 'inited')) {
+          apply();
+          // probe + hook (несколько раз — hls может ещё не успеть появиться)
+          setTimeout(function() { probeAndHookHls('player.' + e.type + '+200'); },  200);
+          setTimeout(function() { probeAndHookHls('player.' + e.type + '+800'); },  800);
+          setTimeout(function() { probeAndHookHls('player.' + e.type + '+2000'); }, 2000);
+        }
       });
     } catch (e) {}
 
     // Канал 2: Lampa.Player.listener (отдельный Listener плеера)
     try {
       if (Lampa.Player && Lampa.Player.listener && Lampa.Player.listener.follow) {
-        Lampa.Player.listener.follow('start', apply);
-        Lampa.Player.listener.follow('video', apply);
+        Lampa.Player.listener.follow('start', function() {
+          apply();
+          setTimeout(function() { probeAndHookHls('Lampa.Player.start+500'); }, 500);
+        });
+        Lampa.Player.listener.follow('video', function() {
+          apply();
+          setTimeout(function() { probeAndHookHls('Lampa.Player.video+500'); }, 500);
+        });
       }
     } catch (e) {}
   }
@@ -1801,6 +1909,7 @@
       online_video:  { ru: 'Видео', en: 'Video', uk: 'Відео' },
       online_nolink: { ru: 'Не удалось извлечь ссылку', en: 'Failed to fetch link', uk: 'Неможливо отримати посилання' },
       title_online:  { ru: 'Онлайн', en: 'Online', uk: 'Онлайн' },
+      title_online_v2: { ru: 'Kinopub 2 (TV)', en: 'Kinopub 2 (TV)', uk: 'Kinopub 2 (TV)' },
       kp_modal_text: { ru: 'Введите код на https://kinopub.tv/device или вставьте имеющийся access-token', en: 'Enter code at https://kinopub.tv/device or paste an existing access-token', uk: 'Введіть код або вставте access-token' },
       kp_modal_wait: { ru: 'Ожидаем код', en: 'Waiting for the code', uk: 'Очікуємо код' },
       kp_oauth_failed: { ru: 'OAuth недоступен. Можно вставить токен с kino.pub/api.', en: 'OAuth unavailable. Paste a token from kino.pub/api.', uk: 'OAuth недоступний. Вставте токен з kino.pub/api.' },
