@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '2.0.6-debug';
+  var PLUGIN_VERSION = '2.0.7-debug';
 
   /* ============================================================
    * REMOTE DEBUG LOGGER (опционально)
@@ -1640,11 +1640,82 @@
     }, 500);
   }
 
+  /**
+   * На Tizen Lampa захватывает window.Hls раньше нашего Proxy-патча, так что
+   * Proxy на конструктор не срабатывает (window.__kp_hls остаётся пустым).
+   * Прототипное патчирование решает это: Hls.prototype.attachMedia — один
+   * объект для ВСЕХ ссылок на класс (хоть кэшированных, хоть свежих),
+   * и new Hls() обязательно проходит через него. Этим способом мы ловим
+   * ЛЮБОЙ инстанс независимо от того, кто и когда его создал.
+   */
+  function patchHlsPrototype() {
+    if (window.__kp_hls_proto_patched) return;
+    if (!window.Hls || !window.Hls.prototype || !window.Hls.prototype.attachMedia) {
+      console.log('[kp2] proto-patch: skip', {
+        has_Hls: !!window.Hls,
+        has_proto: !!(window.Hls && window.Hls.prototype),
+        has_attachMedia: !!(window.Hls && window.Hls.prototype && window.Hls.prototype.attachMedia)
+      });
+      return;
+    }
+    var origAttach = window.Hls.prototype.attachMedia;
+    window.Hls.prototype.attachMedia = function(media) {
+      var instance = this;
+      window.__kp_hls = instance;
+      try {
+        console.log('[kp2] Hls.attachMedia intercepted (proto)', {
+          tracks_n: instance.audioTracks && instance.audioTracks.length
+        });
+      } catch (e) {}
+      try {
+        var EV = window.Hls && window.Hls.Events;
+        if (EV) {
+          if (EV.AUDIO_TRACKS_UPDATED) {
+            instance.on(EV.AUDIO_TRACKS_UPDATED, function() {
+              try {
+                console.log('[kp2] AUDIO_TRACKS_UPDATED (proto)', {
+                  n: instance.audioTracks && instance.audioTracks.length
+                });
+              } catch (e) {}
+              applyKinopubVoice();
+            });
+          }
+          if (EV.MANIFEST_PARSED) {
+            instance.on(EV.MANIFEST_PARSED, function() { setTimeout(applyKinopubVoice, 200); });
+          }
+          if (EV.AUDIO_TRACK_SWITCHED) {
+            instance.on(EV.AUDIO_TRACK_SWITCHED, function() {
+              try {
+                var id = instance.audioTrack;
+                var track = instance.audioTracks && instance.audioTracks[id];
+                var kpAudio = window.__kp_current_audios && window.__kp_current_audios[id];
+                console.log('[kp2] AUDIO_TRACK_SWITCHED (proto)', {
+                  id: id,
+                  track_lang: track && track.lang,
+                  track_name: track && track.name,
+                  kp_audio: kpAudio
+                });
+                if (track || kpAudio) saveKinopubVoice(track, kpAudio);
+              } catch (e) {}
+            });
+          }
+        }
+      } catch (e) {
+        try { console.log('[kp2] proto-hook err', String(e)); } catch (er) {}
+      }
+      return origAttach.apply(this, arguments);
+    };
+    window.__kp_hls_proto_patched = true;
+    console.log('[kp2] Hls.prototype.attachMedia PATCHED');
+  }
+
   function patchHls() {
     if (window.__kp_hls_patched || !window.Hls) return;
     console.log('[kp2] patchHls(): wrapping window.Hls', {
       version: (window.Hls && window.Hls.version) || '?'
     });
+    // Сначала прототипный фоллбек — он самый надёжный на Tizen.
+    patchHlsPrototype();
     var Original = window.Hls;
 
     // Proxy прозрачно форвардит ВСЕ обращения к target — включая
@@ -1719,6 +1790,9 @@
         probes.push(name + '=throw');
       }
     }
+
+    // Каждый probe — ещё и шанс запатчить прототип (если Hls появился позже).
+    try { patchHlsPrototype(); } catch (e) {}
 
     tryPath('window.__kp_hls',          function() { return window.__kp_hls; });
     tryPath('Lampa.PlayerVideo.hls',    function() { return Lampa.PlayerVideo && Lampa.PlayerVideo.hls; });
