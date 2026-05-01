@@ -9,7 +9,76 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '2.0.0-alpha';
+  var PLUGIN_VERSION = '2.0.1-debug';
+
+  /* ============================================================
+   * REMOTE DEBUG LOGGER (опционально)
+   * ============================================================
+   * Включается одной командой через Lampa Terminal:
+   *
+   *   Lampa.Storage.set('kp2_log_url', 'http://<IP_ПК>:8765/l');
+   *   location.reload();
+   *
+   * После релоада все console.log/warn/error/info + window.onerror +
+   * unhandledrejection шлются GET-запросом к указанному URL (через
+   * <Image> — без CORS-preflight, работает на старых Tizen WebView).
+   *
+   * На ПК запускается приёмник: python kp2_log_server.py
+   * Выключение: Lampa.Storage.set('kp2_log_url', '');  → location.reload()
+   * ============================================================ */
+  (function() {
+    var logUrl = '';
+    try { logUrl = (Lampa.Storage.get('kp2_log_url', '') || '').toString(); } catch (e) {}
+    logUrl = logUrl && ('' + logUrl).replace(/^\s+|\s+$/g, '');
+    if (!logUrl) return;
+
+    function ser(v) {
+      if (v === null) return 'null';
+      if (v === undefined) return 'undefined';
+      var t = typeof v;
+      if (t === 'string') return v;
+      if (t === 'number' || t === 'boolean') return String(v);
+      if (t === 'function') return '[Function ' + (v.name || 'anon') + ']';
+      try { return JSON.stringify(v); }
+      catch (e) {
+        try { return String(v); } catch (e2) { return '[unserializable]'; }
+      }
+    }
+    function send(level, args) {
+      try {
+        var parts = [];
+        for (var i = 0; i < args.length; i++) parts.push(ser(args[i]));
+        var line = '[' + level + '] ' + parts.join(' ');
+        if (line.length > 1800) line = line.slice(0, 1800) + '\u2026[trunc]';
+        var sep = logUrl.indexOf('?') < 0 ? '?' : '&';
+        new Image().src = logUrl + sep + 'd=' + encodeURIComponent(line) + '&t=' + Date.now();
+      } catch (e) {}
+    }
+    ['log','info','warn','error'].forEach(function(lvl) {
+      var orig = console[lvl];
+      console[lvl] = function() {
+        try { if (orig) orig.apply(console, arguments); } catch (e) {}
+        send(lvl, arguments);
+      };
+    });
+    window.addEventListener('error', function(e) {
+      send('uncaught', [
+        (e.message || 'error') + ' @ ' + (e.filename || '?') + ':' + (e.lineno || 0) + ':' + (e.colno || 0),
+        (e.error && e.error.stack) ? e.error.stack : ''
+      ]);
+    });
+    window.addEventListener('unhandledrejection', function(e) {
+      var r = e.reason;
+      send('reject', [
+        r && (r.message || String(r)),
+        (r && r.stack) ? r.stack : ''
+      ]);
+    });
+    send('init', [
+      'kp2 v' + PLUGIN_VERSION + ' logger online',
+      'UA=' + (navigator.userAgent || '').slice(0, 140)
+    ]);
+  })();
 
   /* ---------- авторизационные креды и эндпойнты ---------- */
   var api_url   = 'https://api.srvkp.com/v1/';
