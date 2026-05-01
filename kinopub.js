@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.1
+ * Kinopub plugin for Lampa  v1.4.2
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.1';
+  var PLUGIN_VERSION = '1.4.2';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
   var kp_token = 'owe26z7w0ezk6idutpi4mta0th3ouwcd';
@@ -53,7 +53,11 @@
   function fileUrl(f) {
     if (!f) return '';
     if (typeof f.url === 'string') return f.url;
-    if (f.url) return f.url.http || f.url.hls4 || f.url.hls || '';
+    if (f.url) {
+      // Предпочитаем HLS — чанковый стрим стартует быстрее и плеер
+      // адаптивно подбирает битрейт. http (прямой mp4) — фоллбэк.
+      return f.url.hls4 || f.url.hls || f.url.http || '';
+    }
     return '';
   }
 
@@ -254,12 +258,72 @@
 
     function success(item) {
       results = item;
-      extractData(item);
-      filter();
-      append(filtred());
+      // Сериал — сначала пробуем узнать у TMDB реальное число эпизодов на сезон,
+      // чтобы отрезать «лишние» (kinopub складывает спецвыпуски в конец сезона
+      // под номерами 9, 10 и т.п.). Для фильмов сразу идём дальше.
+      var seasons = (item && item.seasons) || [];
+      if (!seasons.length || typeof object.movie.id !== 'number' || !object.movie.name) {
+        afterTmdb({});
+        return;
+      }
+      var counts = {};
+      var pending = 0;
+      var tmdb_id = object.movie.id;
+      var lang    = Lampa.Storage.get('language', 'ru');
+      seasons.forEach(function(s) {
+        var num = parseInt(s.number);
+        if (!num || num < 1) return; // явный season 0 — не запрашиваем, и так специал
+        pending++;
+        var url2 = Lampa.TMDB.api('tv/' + tmdb_id + '/season/' + num + '?api_key=' + Lampa.TMDB.key() + '&language=' + lang);
+        var net2 = new Lampa.Reguest();
+        net2.timeout(8000);
+        net2['native'](url2, function(data) {
+          if (data && data.episodes) counts[num] = data.episodes.length;
+          if (--pending === 0) afterTmdb(counts);
+        }, function() {
+          if (--pending === 0) afterTmdb(counts);
+        });
+      });
+      if (pending === 0) afterTmdb(counts);
+
+      function afterTmdb(map) {
+        results.__tmdb_counts = map;
+        extractData(item);
+        filter();
+        append(filtred());
+      }
     }
 
     /* ---------- разбор kinopub item в структуру extract[transl_id] ---------- */
+
+    function makeEpisodeEntry(seasonNum, ep, transl_id) {
+      var picked = pickBestFile(ep.files);
+      if (!picked) return null;
+      var qq = buildQualityMap(ep.files);
+      return {
+        id:             seasonNum + '_' + ep.number,
+        comment:        ep.number + ' ' + Lampa.Lang.translate('torrent_serial_episode'),
+        title:          ep.title || '',
+        file:           picked.url,
+        episode:        ep.number,
+        season:         seasonNum,
+        quality:        picked.quality,
+        qualities:      qq.qarr,
+        qualities_map:  qq.qmap,
+        translation:    transl_id
+      };
+    }
+
+    function sortSeasonsForDisplay(seasons) {
+      // Реальные сезоны (number > 0) сортируем ASC, явный season 0 (специалы) — в конец.
+      return seasons.slice().sort(function(a, b) {
+        var an = parseInt(a.number) || 0;
+        var bn = parseInt(b.number) || 0;
+        if (an === 0 && bn !== 0) return 1;
+        if (bn === 0 && an !== 0) return -1;
+        return an - bn;
+      });
+    }
 
     function extractData(item) {
       extract = {};
@@ -280,35 +344,60 @@
         });
         if (!voices.length) voices.push('');
 
+        var sortedSeasons = sortSeasonsForDisplay(item.seasons);
+        var tmdbCounts    = (results && results.__tmdb_counts) || {};
+
         voices.forEach(function(v, vi) {
-          var transl_id = vi + 1;
+          var transl_id   = vi + 1;
           var seasonsList = [];
-          item.seasons.forEach(function(season) {
-            var picks = [];
-            (season.episodes || []).forEach(function(ep) {
-              var picked = pickBestFile(ep.files);
-              if (!picked) return;
-              var qq = buildQualityMap(ep.files);
-              picks.push({
-                id:             season.number + '_' + ep.number,
-                comment:        ep.number + ' ' + Lampa.Lang.translate('torrent_serial_episode'),
-                title:          ep.title || '',
-                file:           picked.url,
-                episode:        ep.number,
-                season:         season.number,
-                quality:        picked.quality,
-                qualities:      qq.qarr,
-                qualities_map:  qq.qmap,
-                translation:    transl_id
+          var specials    = [];
+          var seasonIdx   = 0;
+
+          sortedSeasons.forEach(function(season) {
+            var num = parseInt(season.number) || 0;
+
+            if (num === 0) {
+              // явный сезон 0 целиком в спецвыпуски
+              (season.episodes || []).forEach(function(ep) {
+                var entry = makeEpisodeEntry(num, ep, transl_id);
+                if (entry) specials.push(entry);
               });
+              return;
+            }
+
+            var tmdbMax = tmdbCounts[num];
+            var picks   = [];
+            (season.episodes || []).forEach(function(ep) {
+              var entry = makeEpisodeEntry(num, ep, transl_id);
+              if (!entry) return;
+              if (tmdbMax != null && ep.number > tmdbMax) {
+                // kinopub докинул в сезон лишнее → специал
+                specials.push(entry);
+              } else {
+                picks.push(entry);
+              }
             });
+
+            seasonIdx++;
             seasonsList.push({
-              id:          season.number,
-              comment:     season.number + ' ' + Lampa.Lang.translate('torrent_serial_season'),
+              id:          seasonIdx,                // 1-based по позиции в filter_items.season
+              comment:     num + ' ' + Lampa.Lang.translate('torrent_serial_season'),
               folder:      picks,
               translation: transl_id
             });
           });
+
+          if (specials.length) {
+            seasonIdx++;
+            seasonsList.push({
+              id:          seasonIdx,
+              comment:     Lampa.Lang.translate('online_specials'),
+              folder:      specials,
+              translation: transl_id,
+              specials:    true
+            });
+          }
+
           extract[transl_id] = { json: seasonsList, file: '', voice_name: v };
         });
 
@@ -387,9 +476,20 @@
       };
 
       if (results.seasons && results.seasons.length) {
-        results.seasons.forEach(function(s) {
-          filter_items.season.push(Lampa.Lang.translate('torrent_serial_season') + ' ' + s.number);
+        var sortedSeasons = sortSeasonsForDisplay(results.seasons);
+        var tmdbCounts    = (results.__tmdb_counts) || {};
+        var hasSpecials   = false;
+        sortedSeasons.forEach(function(s) {
+          var num = parseInt(s.number) || 0;
+          if (num === 0) { hasSpecials = true; return; }
+          filter_items.season.push(Lampa.Lang.translate('torrent_serial_season') + ' ' + num);
+          var tmdbMax = tmdbCounts[num];
+          if (tmdbMax != null) {
+            var anyOver = (s.episodes || []).some(function(ep) { return ep.number > tmdbMax; });
+            if (anyOver) hasSpecials = true;
+          }
         });
+        if (hasSpecials) filter_items.season.push(Lampa.Lang.translate('online_specials'));
         if (results.__voices && results.__voices.length) {
           results.__voices.forEach(function(v, idx) {
             if (!v) return;
@@ -1003,6 +1103,7 @@
       online_clear_all_marks:     { ru: 'Очистить все метки', en: 'Clear all marks', uk: 'Очистити мітки' },
       online_clear_all_timecodes: { ru: 'Очистить все тайм-коды', en: 'Clear all timecodes', uk: 'Очистити тайм-коди' },
       online_balanser_dont_work:  { ru: 'Поиск не дал результатов', en: 'No results', uk: 'Немає результатів' },
+      online_specials: { ru: 'Спецвыпуски', en: 'Specials', uk: 'Спецвипуски' },
       helper_online_file: { ru: 'Удерживайте «ОК» для контекстного меню', en: 'Hold OK for context menu', uk: 'Утримуйте OK' }
     });
 
