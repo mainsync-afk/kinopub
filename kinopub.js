@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.8
+ * Kinopub plugin for Lampa  v1.4.9
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.8';
+  var PLUGIN_VERSION = '1.4.9';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
   // Время жизни ~24ч, обновлять отсюда https://kino.pub/api → console snippet.
@@ -1198,47 +1198,42 @@
   function ensurePatchHls() {
     // window.Hls появляется только после того как Lampa подгрузит ./vender/hls/hls.js,
     // а это происходит уже ПОСЛЕ нашего startPlugin. Поэтому ждём в фоне.
-    if (window.Hls && window.Hls.__kp_patched) return;
+    if (window.__kp_hls_patched) return;
     if (window.Hls) { patchHls(); return; }
     var tries = 0;
     var iv = setInterval(function() {
-      if (window.Hls && !window.Hls.__kp_patched) {
-        clearInterval(iv);
-        patchHls();
-      } else if (++tries > 120) { // 60 секунд — c запасом
-        clearInterval(iv);
-      }
+      if (window.__kp_hls_patched) { clearInterval(iv); return; }
+      if (window.Hls) { clearInterval(iv); patchHls(); return; }
+      if (++tries > 120) clearInterval(iv); // 60 секунд — c запасом
     }, 500);
   }
 
   function patchHls() {
-    if (!window.Hls || window.Hls.__kp_patched) return;
+    if (window.__kp_hls_patched || !window.Hls) return;
     var Original = window.Hls;
 
-    function Patched(config) {
-      var inst = new Original(config);
-      window.__kp_hls = inst;
-      try {
-        var EV = (Original.Events) || (Patched.Events);
-        if (EV && EV.AUDIO_TRACKS_UPDATED) {
-          inst.on(EV.AUDIO_TRACKS_UPDATED, function() { applyKinopubVoice(); });
-        }
-        if (EV && EV.MANIFEST_PARSED) {
-          inst.on(EV.MANIFEST_PARSED, function() { setTimeout(applyKinopubVoice, 200); });
-        }
-      } catch (e) {}
-      return inst;
-    }
-    // Копируем статику (Events, ErrorTypes, isSupported, ...)
-    for (var k in Original) {
-      if (Object.prototype.hasOwnProperty.call(Original, k)) {
-        try { Patched[k] = Original[k]; } catch (e) {}
+    // Proxy прозрачно форвардит ВСЕ обращения к target — включая
+    // non-enumerable статики (Hls.Events, Hls.ErrorTypes) и геттеры.
+    // Простое копирование через for-in пропускает non-enumerable свойства,
+    // и Lampa крашится на Hls.ErrorTypes.ERROR (=> Cannot read 'ERROR' of undefined).
+    var Patched = new Proxy(Original, {
+      construct: function(target, args) {
+        var inst = Reflect.construct(target, args);
+        window.__kp_hls = inst;
+        try {
+          var EV = target.Events;
+          if (EV && EV.AUDIO_TRACKS_UPDATED) {
+            inst.on(EV.AUDIO_TRACKS_UPDATED, function() { applyKinopubVoice(); });
+          }
+          if (EV && EV.MANIFEST_PARSED) {
+            inst.on(EV.MANIFEST_PARSED, function() { setTimeout(applyKinopubVoice, 200); });
+          }
+        } catch (e) {}
+        return inst;
       }
-    }
-    Patched.prototype = Original.prototype;
-    Patched.__kp_patched = true;
-    Patched.__original = Original;
+    });
     window.Hls = Patched;
+    window.__kp_hls_patched = true;
   }
 
   // Слушаем события плеера: на старт каждого нового стрима (новая серия,
