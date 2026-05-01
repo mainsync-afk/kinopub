@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '2.0.1-debug';
+  var PLUGIN_VERSION = '2.0.2-debug';
 
   /* ============================================================
    * REMOTE DEBUG LOGGER (опционально)
@@ -27,9 +27,13 @@
    * Выключение: Lampa.Storage.set('kp2_log_url', '');  → location.reload()
    * ============================================================ */
   (function() {
+    // ВРЕМЕННЫЙ хардкод на период отладки на Tizen.
+    // Когда логи станут не нужны — поставь LOG_URL_FALLBACK = '' и пушни.
+    var LOG_URL_FALLBACK = 'http://192.168.10.200:8765/l';
     var logUrl = '';
     try { logUrl = (Lampa.Storage.get('kp2_log_url', '') || '').toString(); } catch (e) {}
     logUrl = logUrl && ('' + logUrl).replace(/^\s+|\s+$/g, '');
+    if (!logUrl) logUrl = LOG_URL_FALLBACK;
     if (!logUrl) return;
 
     function ser(v) {
