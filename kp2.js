@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '2.1.1-voiceovers';
+  var PLUGIN_VERSION = '2.1.2-voiceovers';
 
   /* ============================================================
    * REMOTE DEBUG LOGGER (опционально)
@@ -1655,43 +1655,102 @@
    * Для hls.js — пытаемся сначала матчить по lang+name (track.lang часто
    * есть, name бывает пустой), при неудаче — по индексу.
    */
+  /**
+   * AVPlay безопасно: получаем state, проверяем что плеер готов, и при
+   * InvalidStateError на setSelectTrack ретраим в pause/play обёртке.
+   * Это смягчает второй симптом (звук пропадает после нескольких смен).
+   */
+  function avplayState() {
+    try { return (window.webapis.avplay.getState() || '').toUpperCase(); }
+    catch (e) { return ''; }
+  }
+  function avplayGetAudioTracks() {
+    try {
+      var info = window.webapis.avplay.getTotalTrackInfo() || [];
+      var out = [];
+      for (var i = 0; i < info.length; i++) {
+        if ((info[i].type || '').toUpperCase() === 'AUDIO') out.push(info[i]);
+      }
+      return out;
+    } catch (e) { return []; }
+  }
+  function avplaySetTrackSafe(trackIdx) {
+    var st = avplayState();
+    if (st !== 'PLAYING' && st !== 'READY' && st !== 'PAUSED') {
+      console.log('[kp2] avplaySetTrackSafe: bad state', { state: st });
+      return { ok: false, reason: 'bad_state', state: st };
+    }
+    // Стандартный setSelectTrack — самый простой и быстрый путь.
+    try {
+      window.webapis.avplay.setSelectTrack('AUDIO', trackIdx);
+      return { ok: true, mode: 'direct' };
+    } catch (e) {
+      var msg = String(e || '');
+      console.log('[kp2] setSelectTrack direct fail', msg);
+      // На InvalidStateError пробуем через паузу: pause → setSelectTrack → play
+      if (msg.indexOf('InvalidState') >= 0 || msg.indexOf('INVALID_STATE') >= 0) {
+        try {
+          var wasPlaying = (st === 'PLAYING');
+          if (wasPlaying) window.webapis.avplay.pause();
+          window.webapis.avplay.setSelectTrack('AUDIO', trackIdx);
+          if (wasPlaying) window.webapis.avplay.play();
+          return { ok: true, mode: 'pause-play' };
+        } catch (e2) {
+          console.log('[kp2] setSelectTrack pause-play fail', String(e2));
+          return { ok: false, reason: 'pause_play_fail', err: String(e2) };
+        }
+      }
+      return { ok: false, reason: 'direct_fail', err: msg };
+    }
+  }
+
   function applyVoiceToActivePlayer(kpAudio, kpIdx) {
     var ts = Date.now();
     var player_setting = '';
     try { player_setting = Lampa.Storage.field('player') || ''; } catch (e) {}
+    var hasAvplay = !!(window.webapis && window.webapis.avplay);
+    var hls = window.__kp_hls;
+    var hlsTracksN = (hls && hls.audioTracks && hls.audioTracks.length) || 0;
 
-    // ---------- Tizen AVPlay ----------
-    if (player_setting === 'tizen' && window.webapis && window.webapis.avplay) {
-      try {
-        var info = window.webapis.avplay.getTotalTrackInfo() || [];
-        var audioTracks = [];
-        for (var i = 0; i < info.length; i++) {
-          if ((info[i].type || '').toUpperCase() === 'AUDIO') audioTracks.push(info[i]);
-        }
-        var pick = audioTracks[kpIdx] || null;
-        console.log('[kp2] applyVoice: avplay path', {
-          kp_idx: kpIdx, audio_n: audioTracks.length,
-          pick_idx: pick && pick.index, pick_lang: pick && pick.extra_info
-        });
+    console.log('[kp2] applyVoice: enter', {
+      kp_idx: kpIdx,
+      player: player_setting,
+      avplay: hasAvplay,
+      avplay_state: hasAvplay ? avplayState() : '',
+      hls_present: !!hls,
+      hls_tracks_n: hlsTracksN
+    });
+
+    // ---------- Tizen AVPlay path (приоритет на Tizen с player='tizen') ----------
+    if (player_setting === 'tizen' && hasAvplay) {
+      var audioTracks = avplayGetAudioTracks();
+      if (!audioTracks.length) {
+        console.log('[kp2] applyVoice: avplay no tracks yet, will rely on retries');
+      } else {
+        var pick = audioTracks[kpIdx];
         if (pick) {
-          window.webapis.avplay.setSelectTrack('AUDIO', pick.index);
-          return true;
+          var res = avplaySetTrackSafe(pick.index);
+          console.log('[kp2] applyVoice: avplay path', {
+            kp_idx: kpIdx, n: audioTracks.length,
+            pick_idx: pick.index, result: res
+          });
+          if (res.ok) return true;
+        } else {
+          console.log('[kp2] applyVoice: avplay no track at idx', { kp_idx: kpIdx, n: audioTracks.length });
         }
-      } catch (e) {
-        console.log('[kp2] applyVoice: avplay err', String(e));
       }
     }
 
-    // ---------- hls.js ----------
-    // Kinopub строит мастер-плейлист в том же порядке, что и episode.audios,
-    // поэтому для hls тоже используем прямое сопоставление по индексу.
-    var hls = window.__kp_hls;
-    if (hls && hls.audioTracks && hls.audioTracks.length > kpIdx) {
+    // ---------- hls.js path (только когда Lampa реально играет через hls) ----------
+    // На Tizen с player='tizen' window.__kp_hls указывает на hls_parser
+    // (без attachMedia), и hls.audioTrack=id ни на что не влияет.
+    // Эта ветка работает в built-in режиме (player != 'tizen').
+    if (hls && hlsTracksN > kpIdx) {
       try {
         var t = hls.audioTracks[kpIdx];
         var trackId = (typeof t.id === 'number') ? t.id : kpIdx;
         console.log('[kp2] applyVoice: hls path', {
-          kp_idx: kpIdx, hls_n: hls.audioTracks.length,
+          kp_idx: kpIdx, hls_n: hlsTracksN,
           track_id: trackId, track_lang: t.lang, track_name: t.name
         });
         hls.audioTrack = trackId;
@@ -1701,7 +1760,12 @@
       }
     }
 
-    console.log('[kp2] applyVoice: no active player', { took_ms: Date.now() - ts });
+    console.log('[kp2] applyVoice: no active player', {
+      took_ms: Date.now() - ts,
+      reason_player: player_setting,
+      avplay_ready: hasAvplay && (avplayState() === 'PLAYING'),
+      hls_ready: hlsTracksN > 0
+    });
     return false;
   }
 
