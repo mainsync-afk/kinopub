@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '2.0.8-debug';
+  var PLUGIN_VERSION = '2.0.9-debug';
 
   /* ============================================================
    * REMOTE DEBUG LOGGER (опционально)
@@ -1630,13 +1630,26 @@
   function ensurePatchHls() {
     // window.Hls появляется только после того как Lampa подгрузит ./vender/hls/hls.js,
     // а это происходит уже ПОСЛЕ нашего startPlugin. Поэтому ждём в фоне.
-    if (window.__kp_hls_patched) return;
-    if (window.Hls) { patchHls(); return; }
-    var tries = 0;
-    var iv = setInterval(function() {
-      if (window.__kp_hls_patched) { clearInterval(iv); return; }
-      if (window.Hls) { clearInterval(iv); patchHls(); return; }
-      if (++tries > 120) clearInterval(iv); // 60 секунд — c запасом
+    if (window.Hls) patchHls();
+
+    // Watcher на смену window.Hls (Lampa/bwa подменяют 1.1.2 → 1.4.7 на лету,
+    // см. v2.0.8). Каждые 500 мс проверяем, остался ли прототип запатченным —
+    // если нет (новый класс), повторно патчим. Это страховка для прототипного
+    // hook'а; Proxy на конструктор патчим только один раз (window.Hls могут
+    // оборачивать несколько раз, перенакручивать наш Proxy не будем).
+    if (window.__kp_hls_watcher) return;
+    window.__kp_hls_watcher = true;
+    var watcherTries = 0;
+    setInterval(function() {
+      try {
+        if (window.Hls && window.Hls.prototype && !window.Hls.prototype.__kp_proto_patched) {
+          console.log('[kp2] Hls swap detected, re-patching prototype', {
+            version: window.Hls.version
+          });
+          patchHlsPrototype();
+        }
+      } catch (e) {}
+      if (++watcherTries > 600) {} // не выключаем — пусть работает всю сессию (~5 мин минимум)
     }, 500);
   }
 
@@ -1649,28 +1662,27 @@
    * ЛЮБОЙ инстанс независимо от того, кто и когда его создал.
    */
   function patchHlsPrototype() {
-    console.log('[kp2 v2.0.8] patchHlsPrototype: ENTRY', {
-      already: !!window.__kp_hls_proto_patched,
-      has_Hls: !!window.Hls,
-      has_proto: !!(window.Hls && window.Hls.prototype),
-      has_attachMedia: !!(window.Hls && window.Hls.prototype && window.Hls.prototype.attachMedia),
-      proto_keys: window.Hls && window.Hls.prototype
-        ? Object.getOwnPropertyNames(window.Hls.prototype).slice(0, 40)
-        : null,
-      Hls_static_keys: window.Hls ? Object.getOwnPropertyNames(window.Hls).slice(0, 30) : null,
-      Hls_version: window.Hls && window.Hls.version
-    });
-    if (window.__kp_hls_proto_patched) return;
     if (!window.Hls || !window.Hls.prototype || !window.Hls.prototype.attachMedia) {
-      console.log('[kp2 v2.0.8] proto-patch: skip');
+      console.log('[kp2] proto-patch: no Hls/proto/attachMedia, skip');
       return;
     }
-    var origAttach = window.Hls.prototype.attachMedia;
-    window.Hls.prototype.attachMedia = function(media) {
+    // Per-prototype флаг! Lampa/bwa подменяют window.Hls на лету (1.1.2 → 1.4.7),
+    // и каждый новый прототип нужно патчить отдельно. Глобальный флаг здесь не подходит.
+    var proto = window.Hls.prototype;
+    if (proto.__kp_proto_patched) return;
+
+    console.log('[kp2] patchHlsPrototype: applying', {
+      Hls_version: window.Hls.version,
+      proto_keys_count: Object.getOwnPropertyNames(proto).length
+    });
+
+    var origAttach = proto.attachMedia;
+    proto.attachMedia = function(media) {
       var instance = this;
       window.__kp_hls = instance;
       try {
         console.log('[kp2] Hls.attachMedia intercepted (proto)', {
+          v: window.Hls && window.Hls.version,
           tracks_n: instance.audioTracks && instance.audioTracks.length
         });
       } catch (e) {}
@@ -1712,8 +1724,10 @@
       }
       return origAttach.apply(this, arguments);
     };
-    window.__kp_hls_proto_patched = true;
-    console.log('[kp2] Hls.prototype.attachMedia PATCHED');
+    proto.__kp_proto_patched = true;
+    console.log('[kp2] Hls.prototype.attachMedia PATCHED', {
+      version: window.Hls && window.Hls.version
+    });
   }
 
   function patchHls() {
