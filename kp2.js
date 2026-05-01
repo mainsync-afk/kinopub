@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '2.0.3-debug';
+  var PLUGIN_VERSION = '2.0.4-debug';
 
   /* ============================================================
    * REMOTE DEBUG LOGGER (опционально)
@@ -1780,6 +1780,10 @@
         return { name: Lampa.Lang.translate('online_watch'), description: '' };
       },
       onContextLauch: function(object) {
+        console.log('[kp2] manifest.onContextLauch fired', {
+          title: object && object.title,
+          movie_id: object && object.id
+        });
         resetTemplates();
         Lampa.Component.add('online_kinopub2', component);
         Lampa.Activity.push({
@@ -1874,9 +1878,11 @@
     resetTemplates();
 
     Lampa.Listener.follow('full', function(e) {
+      console.log('[kp2] full listener fired', { type: e && e.type });
       if (e.type == 'complite') {
         var btn = $(Lampa.Lang.translate(button));
         btn.on('hover:enter', function() {
+          console.log('[kp2] button hover:enter clicked');
           resetTemplates();
           Lampa.Component.add('online_kinopub2', component);
           Lampa.Activity.push({
@@ -1886,7 +1892,16 @@
             movie: e.data.movie, page: 1
           });
         });
-        e.object.activity.render().find('.view--torrent').after(btn);
+        var $render = e.object && e.object.activity && e.object.activity.render && e.object.activity.render();
+        var $torrent = $render && $render.find('.view--torrent');
+        console.log('[kp2] inserting button', {
+          render_found: !!$render,
+          render_size: $render && $render.length,
+          torrent_found: $torrent && $torrent.length,
+          movie_id: e && e.data && e.data.movie && e.data.movie.id
+        });
+        if ($torrent && $torrent.length) $torrent.after(btn);
+        else if ($render && $render.length) $render.find('.full-start__buttons').append(btn);
       }
     });
 
