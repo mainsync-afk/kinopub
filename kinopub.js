@@ -1,5 +1,5 @@
 /*!
- * Kinopub plugin for Lampa  v1.4.11
+ * Kinopub plugin for Lampa  v1.4.12
  * https://github.com/mainsync-afk/kinopub
  *
  * Источник kino.pub в карточке Lampa. Структура — копия filmix.js,
@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '1.4.11';
+  var PLUGIN_VERSION = '1.4.12';
 
   // TEMP: токен хардкодится в коде. Полноценная авторизация — следующим этапом.
   // Время жизни ~24ч, обновлять отсюда https://kino.pub/api → console snippet.
@@ -294,6 +294,24 @@
       results = null;
     };
 
+    /**
+     * Перерисовать список серий с актуальной озвучкой из cache (saveKinopubVoice
+     * мог обновить storage в момент когда плеер был открыт). choice резетить НЕ
+     * нужно — только подсосать свежие voice_lang/author из getChoice.
+     */
+    this.refresh = function() {
+      if (!results) return;
+      try {
+        if (component.getChoice) {
+          var saved = component.getChoice();
+          Lampa.Arrays.extend(choice, saved, true);
+        }
+      } catch (e) {}
+      component.reset();
+      filter();
+      append(filtred());
+    };
+
     function success(item) {
       results = item;
       // Сериал — сначала пробуем узнать у TMDB реальное число эпизодов на сезон,
@@ -351,7 +369,16 @@
         quality:        picked.quality,
         qualities:      qq.qarr,
         qualities_map:  qq.qmap,
-        translation:    transl_id
+        translation:    transl_id,
+        // компактный список аудио конкретно для этой серии — нужен чтобы
+        // помечать в списке серии где выбранной пользователем дорожки нет
+        audios:         (ep.audios || []).map(function(a) {
+          return {
+            lang:   a.lang || '',
+            author: (a.author && a.author.title) || '',
+            type:   (a.type   && a.type.title)   || ''
+          };
+        })
       };
     }
 
@@ -570,18 +597,37 @@
             var ep = element.json[si];
             if (ep.id == choice.season + 1) {
               ep.folder.forEach(function(media) {
+                // Есть ли у этой серии выбранная пользователем дорожка?
+                var hasVoice = !voiceLang && !voiceAuthor;
+                if (!hasVoice) {
+                  hasVoice = (media.audios || []).some(function(a) {
+                    return audioMatches(a, voiceLang, voiceAuthor);
+                  });
+                }
+                // Если воткнуть label некуда (нет выбора) — пишем пустоту.
+                // Если выбор есть и совпадает — обычная подпись.
+                // Если выбор есть, но в этой серии такой дорожки нет —
+                // пишем тем же текстом, но приглушённо-красным (плеер
+                // всё равно сыграет, просто на дефолтной дорожке).
+                var voiceHtml = '';
+                if (voiceLabel) {
+                  voiceHtml = hasVoice
+                    ? voiceLabel
+                    : '<span style="opacity:.55;color:#ff6e58">' + voiceLabel + '</span>';
+                }
                 out.push({
-                  episode:      parseInt(media.episode),
-                  season:       media.season,
-                  title:        Lampa.Lang.translate('torrent_serial_episode') + ' ' + media.episode + (media.title ? ' — ' + media.title : ''),
-                  quality:      media.quality + 'p ',
-                  qualitys:     media.qualities_map,
-                  translation:  media.translation,
-                  voice_name:   voiceLabel,
-                  voice_lang:   voiceLang,
-                  voice_author: voiceAuthor,
-                  voice_index:  0,
-                  info:         voiceLabel
+                  episode:       parseInt(media.episode),
+                  season:        media.season,
+                  title:         Lampa.Lang.translate('torrent_serial_episode') + ' ' + media.episode + (media.title ? ' — ' + media.title : ''),
+                  quality:       media.quality + 'p ',
+                  qualitys:      media.qualities_map,
+                  translation:   media.translation,
+                  voice_name:    voiceLabel,
+                  voice_lang:    voiceLang,
+                  voice_author:  voiceAuthor,
+                  voice_index:   0,
+                  voice_missing: !hasVoice && !!voiceLabel,
+                  info:          voiceHtml
                 });
               });
               break;
@@ -713,6 +759,23 @@
       files.appendHead(filter.render());
       scroll.body().addClass('torrent-list');
       scroll.minus(files.render().find('.explorer__files-head'));
+
+      // При закрытии плеера перерисовываем список серий, чтобы подпись
+      // выбранной озвучки обновилась моментально (а не только после
+      // переоткрытия карточки).
+      _this.__kp_player_close = function(e) {
+        if (!e) return;
+        if (e.type !== 'destroy' && e.type !== 'close') return;
+        if (Lampa.Activity.active().activity !== _this.activity) return;
+        if (source && source.refresh) source.refresh();
+      };
+      try {
+        if (Lampa.Player && Lampa.Player.listener && Lampa.Player.listener.follow) {
+          Lampa.Player.listener.follow('destroy', _this.__kp_player_close);
+          Lampa.Player.listener.follow('close',   _this.__kp_player_close);
+        }
+      } catch (e) {}
+
       this.search();
     };
 
@@ -1115,6 +1178,14 @@
       files.destroy();
       scroll.destroy();
       if (source && source.destroy) source.destroy();
+      // Снимаем хуки на закрытие плеера, чтобы они не дёргали
+      // уже уничтоженный source при следующем закрытии плеера.
+      try {
+        if (this.__kp_player_close && Lampa.Player && Lampa.Player.listener && Lampa.Player.listener.remove) {
+          Lampa.Player.listener.remove('destroy', this.__kp_player_close);
+          Lampa.Player.listener.remove('close',   this.__kp_player_close);
+        }
+      } catch (e) {}
     };
   }
 
@@ -1126,36 +1197,51 @@
    *      AUDIO TRACK SWITCH (через hls.js / video.audioTracks)
    * ========================================================== */
 
+  // Языки приходят неконсистентно: kinopub-API даёт «rus», hls.js может
+  // отдать «ru». Сравниваем lowercase + startsWith в обе стороны.
+  function langEq(a, b) {
+    if (!a || !b) return false;
+    a = (a + '').toLowerCase(); b = (b + '').toLowerCase();
+    if (a === b) return true;
+    if (a.length > 1 && b.length > 1 && (a.indexOf(b) === 0 || b.indexOf(a) === 0)) return true;
+    return false;
+  }
+  // Имя автора перевода — substring match, case-insensitive.
+  function authorEq(a, b) {
+    if (!a || !b) return false;
+    a = (a + '').toLowerCase(); b = (b + '').toLowerCase();
+    return a === b || a.indexOf(b) >= 0 || b.indexOf(a) >= 0;
+  }
+
   // Подбираем индекс аудио-трека под сохранённую озвучку.
-  // Сначала смотрим точное соответствие по lang+author, потом по lang,
-  // потом по голому индексу (как фоллбэк).
+  // Сначала ищем lang+author, потом только lang, потом по индексу.
   function findAudioTrackIdx(tracks, voice) {
     if (!tracks || !tracks.length || !voice) return -1;
-    var lang = (voice.lang || '').toLowerCase();
-    var author = (voice.author || '').toLowerCase();
+    function tLang(t)  { return t.lang  || t.language || ''; }
+    function tLabel(t) { return t.name  || t.label    || ''; }
 
-    function trackLabel(t) {
-      // hls.js: {lang, name, ...}; native: {language, label, kind}
-      return ((t.name || t.label || '') + '').toLowerCase();
-    }
-    function trackLang(t) {
-      return ((t.lang || t.language || '') + '').toLowerCase();
-    }
-
-    if (lang && author) {
+    if (voice.lang && voice.author) {
       for (var i = 0; i < tracks.length; i++) {
-        if (trackLang(tracks[i]) === lang && trackLabel(tracks[i]).indexOf(author) >= 0) return i;
+        if (langEq(tLang(tracks[i]), voice.lang) && authorEq(tLabel(tracks[i]), voice.author)) return i;
       }
     }
-    if (lang) {
+    if (voice.lang) {
       for (var j = 0; j < tracks.length; j++) {
-        if (trackLang(tracks[j]) === lang) return j;
+        if (langEq(tLang(tracks[j]), voice.lang)) return j;
       }
     }
     if (typeof voice.index === 'number' && voice.index >= 0 && voice.index < tracks.length) {
       return voice.index;
     }
     return -1;
+  }
+
+  // Совпадает ли запись из episode.audios с сохранённым выбором.
+  function audioMatches(audio, voiceLang, voiceAuthor) {
+    if (!voiceLang && !voiceAuthor) return true;
+    if (voiceLang && !langEq(audio.lang || '', voiceLang)) return false;
+    if (voiceAuthor && !authorEq(audio.author || '', voiceAuthor)) return false;
+    return true;
   }
 
   /**
