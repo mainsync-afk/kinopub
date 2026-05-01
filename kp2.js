@@ -9,7 +9,7 @@
 (function() {
   'use strict';
 
-  var PLUGIN_VERSION = '2.0.2-debug';
+  var PLUGIN_VERSION = '2.0.3-debug';
 
   /* ============================================================
    * REMOTE DEBUG LOGGER (опционально)
@@ -291,6 +291,11 @@
    * ========================================================== */
 
   function kpapi(component, _object) {
+    console.log('[kp2] kpapi(): source factory called', {
+      title: _object && _object.title,
+      original_title: _object && _object.original_title,
+      movie_id: _object && _object.movie && _object.movie.id
+    });
     var network       = new Lampa.Reguest();
     var extract       = {};
     var results       = null;        // raw kinopub item
@@ -979,6 +984,11 @@
    * ========================================================== */
 
   function component(object) {
+    console.log('[kp2] component(): constructor called', {
+      title: object && object.title,
+      search: object && object.search,
+      movie_id: object && object.movie && object.movie.id
+    });
     var network = new Lampa.Reguest();
     var scroll  = new Lampa.Scroll({ mask: true, over: true });
     var files   = new Lampa.Explorer(object);
@@ -1632,6 +1642,9 @@
 
   function patchHls() {
     if (window.__kp_hls_patched || !window.Hls) return;
+    console.log('[kp2] patchHls(): wrapping window.Hls', {
+      version: (window.Hls && window.Hls.version) || '?'
+    });
     var Original = window.Hls;
 
     // Proxy прозрачно форвардит ВСЕ обращения к target — включая
@@ -1642,6 +1655,7 @@
       construct: function(target, args) {
         var inst = Reflect.construct(target, args);
         window.__kp_hls = inst;
+        console.log('[kp2] new Hls() intercepted, instance saved');
         try {
           var EV = target.Events;
           // Дорожки готовы → применяем сохранённую озвучку
@@ -1660,10 +1674,13 @@
               try {
                 var id = inst.audioTrack;
                 var track = inst.audioTracks && inst.audioTracks[id];
-                // hls audio idx обычно совпадает с kinopub episode.audios[idx]
-                // (HLS-плейлист генерится в том же порядке) — это даёт нам
-                // точный author/type для сохранения и матчинга.
                 var kpAudio = window.__kp_current_audios && window.__kp_current_audios[id];
+                console.log('[kp2] AUDIO_TRACK_SWITCHED', {
+                  id: id,
+                  track_lang: track && track.lang,
+                  track_name: track && track.name,
+                  kp_audio: kpAudio
+                });
                 if (track || kpAudio) saveKinopubVoice(track, kpAudio);
               } catch (e) {}
             });
@@ -1746,6 +1763,7 @@
   }
 
   function startPlugin() {
+    console.log('[kp2] startPlugin: enter');
     window.online_kinopub2 = true;
     sanitizeKpStorage();  // one-time cleanup от циклов из старых сборок
     ensurePatchHls();     // дождаться window.Hls и подменить конструктор
@@ -1911,6 +1929,15 @@
     }
   }
 
+  try {
+    console.log('[kp2] gate', {
+      already: !!window.online_kinopub2,
+      app_digital: (Lampa.Manifest && Lampa.Manifest.app_digital),
+      hls_present: !!window.Hls,
+      kp_token_len: (kp_token || '').length
+    });
+  } catch (e) {}
   if (!window.online_kinopub2 && Lampa.Manifest.app_digital >= 155) startPlugin();
+  else console.log('[kp2] startPlugin SKIPPED');
 
 })();
